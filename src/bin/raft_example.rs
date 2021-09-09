@@ -1,43 +1,38 @@
 use crossterm::event::{Event, EventStream, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ribut::raft::client::RaftClient;
-use ribut::raft::node::{run_node, RaftNode};
-use std::net::IpAddr;
+use futures::future::{self, Ready};
+use futures::StreamExt;
+use parking_lot::lock_api::RwLock;
+use ribut::raft::node::{start_raft_node, RaftNode};
+use ribut::raft::{node::ConnectionHandle, ClientRPC, ClientRPCClient};
 use std::net::SocketAddr;
-use tokio_stream::StreamExt;
+use std::net::{IpAddr, Ipv6Addr};
+use std::sync::Arc;
+use tarpc::server::{Channel, Incoming, Serve};
+use tarpc::{client, context, server, tokio_serde::formats::Bincode};
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 pub async fn main() {
-    // Start server
-    let server = RaftNode::default();
+    let local = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    start_raft_node(local, 6000, vec![(local, 6001)]);
+    start_raft_node(local, 6001, vec![(local, 6000)]);
 
-    tokio::spawn(run_node(server));
+    let mut joins = Vec::new();
 
-    let mut client = RaftClient::new(SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 5000));
-    client.connect().await;
-
-    let mut reader = EventStream::new();
-
-    enable_raw_mode();
-
-    loop {
-        match reader.next().await {
-            Some(Ok(event)) => {
-                println!("Got key");
-                if event == Event::Key(KeyCode::Esc.into()) {
-                    break;
-                }
-            }
-            Some(Err(msg)) => {
-                panic!("{}", msg);
-            }
-            None => {
-                println!("Got None from event stream");
-                break;
-            }
-        }
+    for i in 0u32..2000 {
+        println!("Creating task {}", i);
+        joins.push(tokio::spawn(async move {
+            let transport =
+                tarpc::serde_transport::tcp::connect("localhost:6000", Bincode::default);
+            let client =
+                ClientRPCClient::new(client::Config::default(), transport.await.unwrap()).spawn();
+            let resp = client.read_log(context::current()).await;
+            // println!("{} - {:?}", i, resp);
+            client.add_entry(context::current(), i.pow(2)).await;
+            let resp = client.read_log(context::current()).await;
+            // println!("{} - {:?}", i, resp);
+        }));
     }
 
-    disable_raw_mode().unwrap();
-    println!();
+    let a = future::join_all(joins).await;
 }

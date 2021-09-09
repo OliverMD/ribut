@@ -1,7 +1,11 @@
 pub mod client;
 pub mod node;
 
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
 
 // Plan:
 // 1. Write a simple client
@@ -12,7 +16,18 @@ use std::collections::HashMap;
 // 6. Add logic for configuration changes
 // 7. Add logic for snapshotting and log compaction
 
-struct NodeId(u32);
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq, Hash)]
+struct NodeId(u64);
+
+impl From<(IpAddr, u16)> for NodeId {
+    fn from((addr, port): (IpAddr, u16)) -> Self {
+        let mut hasher = DefaultHasher::new();
+        addr.hash(&mut hasher);
+        port.hash(&mut hasher);
+
+        NodeId(hasher.finish())
+    }
+}
 
 struct AppendEntriesArgs {
     term: u32,
@@ -38,4 +53,10 @@ struct RequestVoteArgs {
 struct RequestVoteResult {
     term: u32,
     vote_granted: bool,
+}
+
+#[tarpc::service]
+pub trait ClientRPC {
+    async fn read_log() -> Vec<u32>;
+    async fn add_entry(entry: u32);
 }
