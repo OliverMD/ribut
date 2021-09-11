@@ -2,7 +2,7 @@ use crate::raft::node::NodeState::{Candidate, Follower};
 use crate::raft::{ClientRPC, NodeId};
 use anyhow::Result;
 use futures::future::{self, Ready};
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, Stream, StreamExt};
 use itertools::Itertools;
 use parking_lot::RwLock;
 use rand::Rng;
@@ -22,6 +22,7 @@ use tokio::time;
 use tokio::time::Duration;
 use tokio_serde::formats::Bincode;
 use tokio_serde::Framed as SerdeFramed;
+use tokio_stream::{self as stream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -49,8 +50,8 @@ struct LeaderState {
     match_index: Vec<u32>,
 }
 
-#[derive(Clone)]
-pub struct RaftNode {
+#[derive(Default)]
+struct GeneralState {
     // TODO: Persist to disk
     current_term: u32,
     voted_for: Option<NodeId>,
@@ -60,30 +61,81 @@ pub struct RaftNode {
     last_applied: u32,
 
     leader_id: Option<NodeId>,
+}
 
-    node_state: NodeState,
+pub struct RaftNode {
+    state: RwLock<GeneralState>,
+    node_state: RwLock<NodeState>,
     conns: HashMap<NodeId, NodeRPCClient>,
+    node_id: NodeId,
 }
 
 impl RaftNode {
-    fn new(conns: HashMap<NodeId, NodeRPCClient>) -> Self {
+    fn new(node_id: NodeId, conns: HashMap<NodeId, NodeRPCClient>) -> Self {
         Self {
-            current_term: 0,
-            voted_for: None,
-            log: vec![],
-            commit_index: 0,
-            last_applied: 0,
-            leader_id: None,
-            node_state: Default::default(),
+            state: RwLock::new(Default::default()),
+            node_state: RwLock::new(Default::default()),
             conns,
+            node_id,
         }
+    }
+
+    async fn handle_election_timout(&self) {
+        let current_node_state = self.node_state.read().clone();
+        let new_node_state = match current_node_state {
+            Follower => {
+                {
+                    let mut state = self.state.write();
+                    state.current_term += 1;
+                    state.voted_for = Some(self.node_id);
+                }
+
+                let mut resp_stream = {
+                    let state = self.state.read();
+                    let current_term = state.current_term;
+                    let last_log_idx = (state.log.len() - 1) as u32;
+                    let last_log_term = state.log.last().map(|t| t.0).unwrap_or(0);
+
+                    // Working around https://github.com/rust-lang/rust/issues/70263
+                    stream::iter(self.conns.keys().cloned())
+                        .map(move |node| {
+                            let client: &NodeRPCClient = self.conns.get(&node).unwrap();
+
+                            async move {
+                                client
+                                    .request_vote(
+                                        context::current(),
+                                        self.node_id,
+                                        current_term,
+                                        self.node_id,
+                                        last_log_idx,
+                                        last_log_term,
+                                    )
+                                    .await
+                            }
+                        })
+                        .buffer_unordered(self.conns.len())
+                };
+
+                while let a = resp_stream.next().await {}
+
+                // TODO: We need to handle the results of trying to get elected
+
+                Candidate
+            }
+            Candidate => Candidate,
+            NodeState::Leader(_) => {
+                // Should not happen
+                panic!("Leader got election timeout!");
+            }
+        };
     }
 }
 
 // Created for each inbound connection with another node
 #[derive(Clone)]
 pub struct ConnectionHandle {
-    state: Arc<RwLock<RaftNode>>,
+    state: Arc<RaftNode>,
     election_timeout_handler: Sender<()>,
 }
 
@@ -112,7 +164,7 @@ trait NodeRPC {
     ) -> AppendEntriesResult;
 
     async fn request_vote(
-        from: NodeId,
+        from: NodeId, // TODO: Is this the same as candidate_id?
         term: u32,
         candidate_id: NodeId,
         last_log_index: u32,
@@ -132,7 +184,7 @@ impl ConnectionHandle {
         leader_commit: u32,
     ) -> AppendEntriesResult {
         let is_from_leader = {
-            let state = self.state.read();
+            let state = self.state.state.read();
             state.leader_id.map(|l| l == from).unwrap_or(false)
         };
 
@@ -140,11 +192,14 @@ impl ConnectionHandle {
             self.election_timeout_handler.send(()).await;
         }
 
-        let mut state = self.state.write();
+        let mut state = self.state.state.write();
 
         if term < state.current_term {
             state.current_term = term;
-            state.node_state = Follower;
+            {
+                let mut node_state = self.state.node_state.write();
+                *node_state = Follower;
+            }
 
             return AppendEntriesResult {
                 term: state.current_term,
@@ -206,13 +261,14 @@ impl ConnectionHandle {
         last_log_index: u32,
         last_log_term: u32, // TODO: Need to figure out why this is here?
     ) -> RequestVoteResult {
-        let mut state = self.state.write();
+        let mut state = self.state.state.write();
 
         if term > state.current_term {
             state.current_term = term;
             state.voted_for = Option::None;
 
-            state.node_state = Follower;
+            let mut node_state = self.state.node_state.write();
+            *node_state = Follower;
         }
 
         let vote_granted = term >= state.current_term
@@ -277,6 +333,7 @@ impl ClientRPC for ConnectionHandle {
     fn read_log(self, _: context::Context) -> Self::ReadLogFut {
         future::ready(
             self.state
+                .state
                 .read()
                 .log
                 .iter()
@@ -314,29 +371,35 @@ pub async fn start_raft_node(
         conns.insert(NodeId::from(conn_info), client);
     }
 
-    let state = Arc::new(RwLock::new(RaftNode::new(conns)));
+    let state = Arc::new(RaftNode::new((bind_addr, bind_port).into(), conns));
 
     let mut rng = rand::thread_rng();
 
     let election_timeout = Duration::from_millis(500 + rng.gen_range(0..100));
 
     let (heartbeat_tx, mut election_rx) = mpsc::channel(10);
-    tokio::spawn(async move {
-        loop {
-            match time::timeout(election_timeout, election_rx.recv()).await {
-                Ok(Some(())) => {
-                    // Do nothing we got the heartbeat in time
-                }
-                Ok(None) => {
-                    break;
-                }
-                Err(_) => {
-                    // Election timeout, start election
-                    todo!()
+
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                match time::timeout(election_timeout, election_rx.recv()).await {
+                    Ok(Some(())) => {
+                        // Do nothing we got the heartbeat in time
+                    }
+                    Ok(None) => {
+                        break;
+                    }
+                    Err(_) => {
+                        // Election timeout
+                        // TODO: Do we want to await here or continue the timeout tracking, should
+                        // we launch another task here?
+                        state.handle_election_timout().await;
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
     let server_fut = listener.
         // Ignore accept errors.
