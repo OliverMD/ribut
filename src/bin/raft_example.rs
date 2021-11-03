@@ -14,12 +14,12 @@ use tarpc::{client, context, server, tokio_serde::formats::Bincode};
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 pub async fn main() {
     let local = IpAddr::V6(Ipv6Addr::LOCALHOST);
-    start_raft_node(local, 6000, vec![(local, 6001)]);
-    start_raft_node(local, 6001, vec![(local, 6000)]);
+    start_raft_node(local, 6000, vec![(local, 6001)]).await;
+    start_raft_node(local, 6001, vec![(local, 6000)]).await;
 
     let mut joins = Vec::new();
 
-    for i in 0u32..2000 {
+    for i in 0u32..2 {
         println!("Creating task {}", i);
         joins.push(tokio::spawn(async move {
             let transport =

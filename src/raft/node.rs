@@ -34,7 +34,10 @@ enum LogEntry {
 #[derive(Clone)]
 enum NodeState {
     Follower,
-    Candidate,
+    Candidate {
+        response_count: u32,
+        vote_count: u32,
+    },
     Leader(LeaderState),
 }
 
@@ -82,14 +85,24 @@ impl RaftNode {
 
     async fn handle_election_timout(&self) {
         let current_node_state = self.node_state.read().clone();
-        let new_node_state = match current_node_state {
+        match current_node_state {
             Follower => {
                 {
                     let mut state = self.state.write();
                     state.current_term += 1;
                     state.voted_for = Some(self.node_id);
+
+                    *self.node_state.write() = Candidate {
+                        response_count: 0,
+                        vote_count: 0,
+                    };
                 }
 
+                let mut response_count = 0;
+                let mut vote_count = 0;
+                let expected_responses = self.conns.len();
+
+                // Send out the requests for votes
                 let mut resp_stream = {
                     let state = self.state.read();
                     let current_term = state.current_term;
@@ -117,13 +130,33 @@ impl RaftNode {
                         .buffer_unordered(self.conns.len())
                 };
 
-                while let a = resp_stream.next().await {}
-
-                // TODO: We need to handle the results of trying to get elected
-
-                Candidate
+                while let Some(res) = resp_stream.next().await {
+                    match res {
+                        Ok(RequestVoteResult { term, vote_granted }) => {
+                            if vote_granted {
+                                response_count += 1;
+                                vote_count += 1;
+                            } else {
+                                response_count += 1;
+                                if term > self.state.read().current_term {
+                                    self.state.write().current_term = term;
+                                    // Become follower line 404 of spec
+                                    *self.node_state.write() = Follower;
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // TODO: Retry? Or Logging? Does tarpc retry?
+                            println!("Received error send request vote: {}", e)
+                        }
+                    }
+                }
             }
-            Candidate => Candidate,
+            NodeState::Candidate {
+                response_count,
+                vote_count,
+            } => {}
             NodeState::Leader(_) => {
                 // Should not happen
                 panic!("Leader got election timeout!");
@@ -394,7 +427,8 @@ pub async fn start_raft_node(
                         // Election timeout
                         // TODO: Do we want to await here or continue the timeout tracking, should
                         // we launch another task here?
-                        state.handle_election_timout().await;
+                        let state = state.clone();
+                        tokio::spawn(async move { state.handle_election_timout().await });
                     }
                 }
             }
@@ -418,5 +452,6 @@ pub async fn start_raft_node(
         .buffer_unordered(10000)
         .for_each(|_| async {});
 
+    println!("Spawned");
     tokio::spawn(server_fut)
 }
