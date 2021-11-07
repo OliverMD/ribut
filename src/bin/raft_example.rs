@@ -4,12 +4,13 @@ use futures::future::{self, Ready};
 use futures::StreamExt;
 use parking_lot::lock_api::RwLock;
 use ribut::raft::node::{start_raft_node, RaftNode};
-use ribut::raft::{node::ConnectionHandle, ClientRPC, ClientRPCClient};
+use ribut::raft::{node::ConnectionHandler, ClientRPC, ClientRPCClient};
 use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
-use tarpc::server::{Channel, Incoming, Serve};
+use tarpc::server::{incoming, Channel, Serve};
 use tarpc::{client, context, server, tokio_serde::formats::Bincode};
+use tokio::time::Duration;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 pub async fn main() {
@@ -27,12 +28,14 @@ pub async fn main() {
             let client =
                 ClientRPCClient::new(client::Config::default(), transport.await.unwrap()).spawn();
             let resp = client.read_log(context::current()).await;
-            // println!("{} - {:?}", i, resp);
+            println!("{} - {:?}", i, resp);
             client.add_entry(context::current(), i.pow(2)).await;
             let resp = client.read_log(context::current()).await;
-            // println!("{} - {:?}", i, resp);
+            println!("{} - {:?}", i, resp);
         }));
     }
 
     let a = future::join_all(joins).await;
+
+    tokio::time::sleep(Duration::from_secs(60)).await;
 }

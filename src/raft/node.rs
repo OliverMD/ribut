@@ -7,6 +7,7 @@ use itertools::Itertools;
 use parking_lot::RwLock;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::borrow::BorrowMut;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -69,17 +70,30 @@ struct GeneralState {
 pub struct RaftNode {
     state: RwLock<GeneralState>,
     node_state: RwLock<NodeState>,
-    conns: HashMap<NodeId, NodeRPCClient>,
+    conn_infos: Vec<(IpAddr, u16)>,
+    conns: RwLock<HashMap<NodeId, NodeRPCClient>>, // TODO: Can we do better?
     node_id: NodeId,
 }
 
 impl RaftNode {
-    fn new(node_id: NodeId, conns: HashMap<NodeId, NodeRPCClient>) -> Self {
+    fn new(node_id: NodeId, conn_infos: Vec<(IpAddr, u16)>) -> Self {
         Self {
             state: RwLock::new(Default::default()),
             node_state: RwLock::new(Default::default()),
-            conns,
+            conn_infos,
+            conns: RwLock::new(HashMap::new()),
             node_id,
+        }
+    }
+
+    async fn connect(&self) {
+        for (ip, port) in &self.conn_infos {
+            let transport = tarpc::serde_transport::tcp::connect((*ip, *port), Bincode::default);
+            let client =
+                NodeRPCClient::new(client::Config::default(), transport.await.unwrap()).spawn();
+            self.conns
+                .write()
+                .insert(NodeId::from((*ip, *port)), client);
         }
     }
 
@@ -100,7 +114,6 @@ impl RaftNode {
 
                 let mut response_count = 0;
                 let mut vote_count = 0;
-                let expected_responses = self.conns.len();
 
                 // Send out the requests for votes
                 let mut resp_stream = {
@@ -109,10 +122,13 @@ impl RaftNode {
                     let last_log_idx = (state.log.len() - 1) as u32;
                     let last_log_term = state.log.last().map(|t| t.0).unwrap_or(0);
 
+                    let keys: Vec<_> = self.conns.read().keys().cloned().collect();
+
                     // Working around https://github.com/rust-lang/rust/issues/70263
-                    stream::iter(self.conns.keys().cloned())
+                    stream::iter(keys)
                         .map(move |node| {
-                            let client: &NodeRPCClient = self.conns.get(&node).unwrap();
+                            // let client = self.conns.clone().read().get(&node).unwrap();
+                            let client = self.conns.read().get(&node).unwrap().clone();
 
                             async move {
                                 client
@@ -127,7 +143,7 @@ impl RaftNode {
                                     .await
                             }
                         })
-                        .buffer_unordered(self.conns.len())
+                        .buffer_unordered(self.conns.read().len())
                 };
 
                 while let Some(res) = resp_stream.next().await {
@@ -167,7 +183,7 @@ impl RaftNode {
 
 // Created for each inbound connection with another node
 #[derive(Clone)]
-pub struct ConnectionHandle {
+pub struct ConnectionHandler {
     state: Arc<RaftNode>,
     election_timeout_handler: Sender<()>,
 }
@@ -205,7 +221,7 @@ trait NodeRPC {
     ) -> RequestVoteResult;
 }
 
-impl ConnectionHandle {
+impl ConnectionHandler {
     async fn append_entries_impl(
         self,
         from: NodeId,
@@ -321,7 +337,7 @@ impl ConnectionHandle {
 }
 
 #[tarpc::server]
-impl NodeRPC for ConnectionHandle {
+impl NodeRPC for ConnectionHandler {
     async fn append_entries(
         self,
         _: context::Context,
@@ -360,7 +376,7 @@ impl NodeRPC for ConnectionHandle {
 }
 
 #[tarpc::server]
-impl ClientRPC for ConnectionHandle {
+impl ClientRPC for ConnectionHandler {
     type ReadLogFut = Ready<Vec<u32>>;
 
     fn read_log(self, _: context::Context) -> Self::ReadLogFut {
@@ -395,16 +411,7 @@ pub async fn start_raft_node(
             .unwrap();
     listener.config_mut().max_frame_length(usize::MAX);
 
-    let mut conns: HashMap<NodeId, NodeRPCClient> = HashMap::new();
-    for conn_info in others {
-        let transport = tarpc::serde_transport::tcp::connect(conn_info, Bincode::default);
-        let client =
-            NodeRPCClient::new(client::Config::default(), transport.await.unwrap()).spawn();
-
-        conns.insert(NodeId::from(conn_info), client);
-    }
-
-    let state = Arc::new(RaftNode::new((bind_addr, bind_port).into(), conns));
+    let state = Arc::new(RaftNode::new((bind_addr, bind_port).into(), others));
 
     let mut rng = rand::thread_rng();
 
@@ -435,6 +442,7 @@ pub async fn start_raft_node(
         });
     }
 
+    let our_state = state.clone();
     let server_fut = listener.
         // Ignore accept errors.
         filter_map(|r| future::ready(r.ok()))
@@ -443,7 +451,7 @@ pub async fn start_raft_node(
         // the generated World trait.
         .map(move |channel| {
             // Created for every new connection
-            let server = ConnectionHandle {
+            let server = ConnectionHandler {
                 state: state.clone(),
                 election_timeout_handler: heartbeat_tx.clone(),
             };
@@ -453,5 +461,6 @@ pub async fn start_raft_node(
         .for_each(|_| async {});
 
     println!("Spawned");
+    our_state.connect();
     tokio::spawn(server_fut)
 }
