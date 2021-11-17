@@ -94,8 +94,10 @@ impl RaftNode {
                         tarpc::serde_transport::tcp::connect((*ip, *port), Bincode::default);
                     match transport.await {
                         Ok(res) => break res,
-                        Err(e) => println!("{}", e),
+                        Err(e) => println!("[{}] - {}", self.node_id, e),
                     }
+
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                 }
             };
 
@@ -414,9 +416,12 @@ pub async fn start_raft_node(
     node_bind_port: u16,
     others: Vec<(IpAddr, u16)>,
 ) {
-    let state = Arc::new(RaftNode::new((bind_addr, client_bind_port).into(), others));
+    let node_id = (bind_addr, node_bind_port).into();
+    let state = Arc::new(RaftNode::new(node_id, others));
     let election_timeout = Duration::from_millis(500 + rand::thread_rng().gen_range(0..100));
     let (heartbeat_tx, mut election_rx) = mpsc::channel(10);
+
+    println!("{} - Starting node server", node_id);
 
     start_node_server(
         state.clone(),
@@ -425,8 +430,14 @@ pub async fn start_raft_node(
         node_bind_port,
     )
     .await;
+
+    println!("{} - Connecting to other nodes", node_id);
+
     state.connect().await;
+
+    println!("{} - Starting election timeout", node_id);
     start_election_timeout(state.clone(), election_timeout, election_rx);
+    println!("{} - Starting client server", node_id);
     start_client_server(
         state.clone(),
         heartbeat_tx.clone(),
@@ -434,6 +445,8 @@ pub async fn start_raft_node(
         client_bind_port,
     )
     .await;
+
+    println!("{} - Node startup complete", node_id);
 }
 
 async fn start_node_server(

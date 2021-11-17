@@ -14,9 +14,13 @@ use tokio::time::Duration;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 pub async fn main() {
-    let local = IpAddr::V6(Ipv6Addr::LOCALHOST);
-    start_raft_node(local, 6000, 7000, vec![(local, 7001)]).await;
-    start_raft_node(local, 6001, 7001, vec![(local, 7000)]).await;
+    const LOCAL: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let node_a =
+        tokio::spawn(async { start_raft_node(LOCAL, 6000, 7000, vec![(LOCAL, 7001)]).await });
+    let node_b =
+        tokio::spawn(async { start_raft_node(LOCAL, 6001, 7001, vec![(LOCAL, 7000)]).await });
+
+    future::join_all(vec![node_a, node_b]).await;
 
     let mut joins = Vec::new();
 
@@ -37,5 +41,5 @@ pub async fn main() {
 
     let a = future::join_all(joins).await;
 
-    tokio::time::sleep(Duration::from_secs(60)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 }

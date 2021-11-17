@@ -4,6 +4,7 @@ pub mod node;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 
@@ -18,6 +19,12 @@ use std::net::IpAddr;
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq, Hash)]
 struct NodeId(u64);
+
+impl Display for NodeId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{}>", self.0)
+    }
+}
 
 impl From<(IpAddr, u16)> for NodeId {
     fn from((addr, port): (IpAddr, u16)) -> Self {
