@@ -2,29 +2,23 @@ use crate::raft::node::NodeState::{Candidate, Follower};
 use crate::raft::{ClientRPC, NodeId};
 use anyhow::Result;
 use futures::future::{self, Ready};
-use futures::{SinkExt, Stream, StreamExt};
+use futures::StreamExt;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::borrow::BorrowMut;
 use std::cmp::min;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::thread::sleep;
-use tarpc::server::{Channel, Serve};
+use tarpc::server::Channel;
 use tarpc::{client, context, server};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::task::JoinHandle;
 use tokio::time;
 use tokio::time::Duration;
 use tokio_serde::formats::Bincode;
-use tokio_serde::Framed as SerdeFramed;
 use tokio_stream::{self as stream};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum LogEntry {
@@ -248,7 +242,7 @@ impl ConnectionHandler {
         };
 
         if is_from_leader {
-            self.election_timeout_handler.send(()).await;
+            self.election_timeout_handler.send(()).await.unwrap();
         }
 
         let mut state = self.state.state.write();
@@ -419,7 +413,7 @@ pub async fn start_raft_node(
     let node_id = (bind_addr, node_bind_port).into();
     let state = Arc::new(RaftNode::new(node_id, others));
     let election_timeout = Duration::from_millis(500 + rand::thread_rng().gen_range(0..100));
-    let (heartbeat_tx, mut election_rx) = mpsc::channel(10);
+    let (heartbeat_tx, election_rx) = mpsc::channel(10);
 
     println!("{} - Starting node server", node_id);
 
@@ -455,7 +449,7 @@ async fn start_node_server(
     bind_addr: IpAddr,
     bind_port: u16,
 ) {
-    let mut node_listener =
+    let node_listener =
         tarpc::serde_transport::tcp::listen(&(bind_addr, bind_port), Bincode::default)
             .await
             .unwrap();
