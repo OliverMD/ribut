@@ -1,4 +1,4 @@
-use crate::raft::node::NodeState::{Candidate, Follower};
+use crate::raft::node::NodeState::{Candidate, Follower, Leader};
 use crate::raft::{ClientRPC, NodeId};
 use anyhow::Result;
 use futures::future::{self, Ready};
@@ -44,8 +44,8 @@ impl Default for NodeState {
 
 #[derive(Default, Clone)]
 struct LeaderState {
-    next_index: Vec<u32>,
-    match_index: Vec<u32>,
+    next_index: HashMap<NodeId, u32>,
+    match_index: HashMap<NodeId, u32>,
 }
 
 #[derive(Default)]
@@ -53,6 +53,8 @@ struct GeneralState {
     // TODO: Persist to disk
     current_term: u32,
     voted_for: Option<NodeId>,
+
+    // u32 is the term
     log: Vec<(u32, LogEntry)>, // TODO: This likely needs to be indexed from 1
 
     commit_index: u32,
@@ -151,19 +153,54 @@ impl RaftNode {
                 };
 
                 while let Some(res) = resp_stream.next().await {
+                    // TODO: Check the state we're on each loop
                     match res {
                         Ok(RequestVoteResult { term, vote_granted }) => {
-                            if vote_granted {
-                                response_count += 1;
-                                vote_count += 1;
-                            } else {
-                                response_count += 1;
-                                if term > self.state.read().current_term {
-                                    self.state.write().current_term = term;
-                                    // Become follower line 404 of spec
-                                    *self.node_state.write() = Follower;
-                                    break;
+                            if term >= self.state.read().current_term {
+                                if vote_granted {
+                                    response_count += 1;
+                                    vote_count += 1;
+
+                                    // Check if we can become leader
+
+                                    if matches!(
+                                        *self.node_state.read(),
+                                        NodeState::Candidate { .. }
+                                    ) && vote_count >= self.conn_infos.len() / 2
+                                    {
+                                        let set_idx: u32 = self.state.read().log.len() as u32;
+                                        *self.node_state.write() = NodeState::Leader(LeaderState {
+                                            next_index: self
+                                                .conns
+                                                .read()
+                                                .keys()
+                                                .map(|n| (*n, set_idx))
+                                                .collect(),
+                                            match_index: self
+                                                .conns
+                                                .read()
+                                                .keys()
+                                                .map(|n| (*n, 0))
+                                                .collect(),
+                                        });
+
+                                        println!("{} - We are now leader", self.node_id);
+                                        break; // We are now leader
+                                    }
+                                } else {
+                                    response_count += 1;
+                                    if term > self.state.read().current_term {
+                                        self.state.write().current_term = term;
+                                        // Become follower line 404 of spec
+                                        *self.node_state.write() = Follower;
+                                        break;
+                                    }
                                 }
+                            } else {
+                                println!(
+                                    "{} - Ignoring response due to outdated term",
+                                    self.node_id
+                                )
                             }
                         }
                         Err(e) => {
@@ -178,8 +215,7 @@ impl RaftNode {
                 vote_count,
             } => {}
             NodeState::Leader(_) => {
-                // Should not happen
-                panic!("Leader got election timeout!");
+                // Ignore
             }
         };
     }
@@ -236,9 +272,12 @@ impl ConnectionHandler {
         entries: Vec<(u32, u32, LogEntry)>, // idx, term, entry
         leader_commit: u32,
     ) -> AppendEntriesResult {
+        // println!("{} - Received append entries request", self.state.node_id);
+
         let is_from_leader = {
             let state = self.state.state.read();
             state.leader_id.map(|l| l == from).unwrap_or(false)
+                || (term >= state.current_term && leader_id == from)
         };
 
         if is_from_leader {
@@ -327,16 +366,23 @@ impl ConnectionHandler {
         let vote_granted = term >= state.current_term
             && (state.voted_for.is_none()
                 || state.voted_for.map(|c| c == candidate_id).unwrap_or(false))
-            && last_log_index > (state.log.len() as u32 - 1);
+            && last_log_index >= (state.log.len() as u32);
 
         if vote_granted {
             state.voted_for = Some(candidate_id);
         }
 
-        RequestVoteResult {
+        let res = RequestVoteResult {
             term: state.current_term,
             vote_granted,
-        }
+        };
+
+        println!(
+            "{} - Sending Request vote response to {} - {:?}",
+            self.state.node_id, candidate_id, res
+        );
+
+        res
     }
 }
 
@@ -412,7 +458,7 @@ pub async fn start_raft_node(
 ) {
     let node_id = (bind_addr, node_bind_port).into();
     let state = Arc::new(RaftNode::new(node_id, others));
-    let election_timeout = Duration::from_millis(500 + rand::thread_rng().gen_range(0..100));
+    let election_timeout = Duration::from_millis(1000 + rand::thread_rng().gen_range(0..250));
     let (heartbeat_tx, election_rx) = mpsc::channel(10);
 
     println!("{} - Starting node server", node_id);
@@ -429,6 +475,8 @@ pub async fn start_raft_node(
 
     state.connect().await;
 
+    println!("{} - Starting heartbeats", node_id);
+    start_heartbeats(state.clone());
     println!("{} - Starting election timeout", node_id);
     start_election_timeout(state.clone(), election_timeout, election_rx);
     println!("{} - Starting client server", node_id);
@@ -507,6 +555,45 @@ async fn start_client_server(
     tokio::spawn(server_for_client_fut);
 }
 
+// TODO: This doesn't need to be running all the time, change this to only be running when the node is a leader
+fn start_heartbeats(state: Arc<RaftNode>) {
+    let mut interval = time::interval(Duration::from_millis(200));
+    let node_id = state.node_id;
+    let clients: Vec<NodeRPCClient> = { state.conns.read().values().cloned().collect() };
+
+    tokio::spawn(async move {
+        loop {
+            if matches!(*state.node_state.read(), NodeState::Leader(_)) {
+                let (current_term, last_log_idx, last_log_term) = {
+                    let state = state.state.read();
+                    (
+                        state.current_term,
+                        state.log.len() as u32,
+                        state.log.last().map(|t| t.0).unwrap_or(0),
+                    )
+                };
+
+                for client in &clients {
+                    // println!("{} - Sending heartbeat", node_id);
+                    client
+                        .append_entries(
+                            context::current(),
+                            node_id,
+                            current_term,
+                            node_id,
+                            last_log_idx,
+                            last_log_term,
+                            vec![],
+                            last_log_idx,
+                        )
+                        .await;
+                }
+            }
+            interval.tick().await;
+        }
+    });
+}
+
 fn start_election_timeout(
     state: Arc<RaftNode>,
     election_timeout: Duration,
@@ -522,6 +609,9 @@ fn start_election_timeout(
                     break;
                 }
                 Err(_) => {
+                    if !matches!(*state.node_state.read(), NodeState::Leader(_)) {
+                        println!("{} - Election timeout hit", state.node_id);
+                    }
                     // Election timeout
                     // TODO: Do we want to await here or continue the timeout tracking, should
                     // we launch another task here?

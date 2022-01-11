@@ -37,5 +37,5 @@ pub async fn main() {
 
     future::join_all(joins).await;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(20)).await;
 }
