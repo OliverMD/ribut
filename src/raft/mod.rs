@@ -44,6 +44,7 @@ struct AppendEntriesArgs {
     leader_commit: u32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 struct AppendEntriesResult {
     term: u32,
     success: bool,
@@ -56,13 +57,40 @@ struct RequestVoteArgs {
     last_log_term: u32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 struct RequestVoteResult {
     term: u32,
     vote_granted: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum LogEntry {
+    Config,
+    Other(u32),
 }
 
 #[tarpc::service]
 pub trait ClientRPC {
     async fn read_log() -> Vec<u32>;
     async fn add_entry(entry: u32);
+}
+
+#[tarpc::service]
+trait NodeRPC {
+    async fn append_entries(
+        from: NodeId, // TODO: This feels a little brittle, how can this be improved?
+        term: u32,
+        leader_id: NodeId,
+        prev_log_index: u32,
+        prev_log_term: u32,
+        entries: Vec<(u32, u32, LogEntry)>,
+        leader_commit: u32,
+    ) -> AppendEntriesResult;
+
+    async fn request_vote(
+        term: u32,
+        candidate_id: NodeId,
+        last_log_index: u32,
+        last_log_term: u32,
+    ) -> RequestVoteResult;
 }

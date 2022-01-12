@@ -1,5 +1,7 @@
 use crate::raft::node::NodeState::{Candidate, Follower, Leader};
-use crate::raft::{ClientRPC, NodeId};
+use crate::raft::{
+    AppendEntriesResult, ClientRPC, LogEntry, NodeId, NodeRPC, NodeRPCClient, RequestVoteResult,
+};
 use anyhow::Result;
 use futures::future::{self, Ready};
 use futures::StreamExt;
@@ -19,12 +21,6 @@ use tokio::time;
 use tokio::time::Duration;
 use tokio_serde::formats::Bincode;
 use tokio_stream::{self as stream};
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum LogEntry {
-    Config,
-    Other(u32),
-}
 
 #[derive(Clone)]
 enum NodeState {
@@ -140,7 +136,6 @@ impl RaftNode {
                                 client
                                     .request_vote(
                                         context::current(),
-                                        self.node_id,
                                         current_term,
                                         self.node_id,
                                         last_log_idx,
@@ -228,48 +223,17 @@ pub struct ConnectionHandler {
     election_timeout_handler: Sender<()>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct AppendEntriesResult {
-    term: u32,
-    success: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RequestVoteResult {
-    term: u32,
-    vote_granted: bool,
-}
-
-#[tarpc::service]
-trait NodeRPC {
+#[tarpc::server]
+impl NodeRPC for ConnectionHandler {
     async fn append_entries(
-        from: NodeId, // TODO: This feels a little brittle, how can this be improved?
-        term: u32,
-        leader_id: NodeId,
-        prev_log_index: u32,
-        prev_log_term: u32,
-        entries: Vec<(u32, u32, LogEntry)>,
-        leader_commit: u32,
-    ) -> AppendEntriesResult;
-
-    async fn request_vote(
-        from: NodeId, // TODO: Is this the same as candidate_id?
-        term: u32,
-        candidate_id: NodeId,
-        last_log_index: u32,
-        last_log_term: u32,
-    ) -> RequestVoteResult;
-}
-
-impl ConnectionHandler {
-    async fn append_entries_impl(
         self,
+        _: context::Context,
         from: NodeId,
         term: u32,
         leader_id: NodeId,
         prev_log_index: u32,
         prev_log_term: u32,
-        entries: Vec<(u32, u32, LogEntry)>, // idx, term, entry
+        entries: Vec<(u32, u32, LogEntry)>,
         leader_commit: u32,
     ) -> AppendEntriesResult {
         // println!("{} - Received append entries request", self.state.node_id);
@@ -345,13 +309,13 @@ impl ConnectionHandler {
         }
     }
 
-    async fn request_vote_impl(
+    async fn request_vote(
         self,
-        from: NodeId,
+        _: context::Context,
         term: u32,
         candidate_id: NodeId,
         last_log_index: u32,
-        last_log_term: u32, // TODO: Need to figure out why this is here?
+        last_log_term: u32,
     ) -> RequestVoteResult {
         let mut state = self.state.state.write();
 
@@ -383,45 +347,6 @@ impl ConnectionHandler {
         );
 
         res
-    }
-}
-
-#[tarpc::server]
-impl NodeRPC for ConnectionHandler {
-    async fn append_entries(
-        self,
-        _: context::Context,
-        from: NodeId,
-        term: u32,
-        leader_id: NodeId,
-        prev_log_index: u32,
-        prev_log_term: u32,
-        entries: Vec<(u32, u32, LogEntry)>,
-        leader_commit: u32,
-    ) -> AppendEntriesResult {
-        self.append_entries_impl(
-            from,
-            term,
-            leader_id,
-            prev_log_index,
-            prev_log_term,
-            entries,
-            leader_commit,
-        )
-        .await
-    }
-
-    async fn request_vote(
-        self,
-        _: context::Context,
-        from: NodeId,
-        term: u32,
-        candidate_id: NodeId,
-        last_log_index: u32,
-        last_log_term: u32,
-    ) -> RequestVoteResult {
-        self.request_vote_impl(from, term, candidate_id, last_log_index, last_log_term)
-            .await
     }
 }
 
