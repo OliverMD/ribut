@@ -9,9 +9,11 @@ use itertools::Itertools;
 use parking_lot::RwLock;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::cmp::min;
+use std::borrow::Borrow;
+use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use tarpc::server::Channel;
 use tarpc::{client, context, server};
@@ -75,6 +77,26 @@ impl RaftNode {
             conn_infos,
             conns: RwLock::new(HashMap::new()),
             node_id,
+        }
+    }
+
+    fn entries_to_send(&self, node_id: NodeId) -> Vec<(u32, u32, LogEntry)> {
+        if let NodeState::Leader(LeaderState {
+            next_index,
+            match_index,
+        }) = self.node_state.read().deref()
+        {
+            let next_idx = next_index.get(&node_id).cloned().unwrap_or(0);
+            self.state
+                .read()
+                .log
+                .iter()
+                .enumerate()
+                .skip(next_idx as usize)
+                .map(|(i, (t, e))| (i as u32, *t, e.clone()))
+                .collect()
+        } else {
+            vec![]
         }
     }
 
@@ -260,6 +282,7 @@ impl NodeRPC for ConnectionHandler {
             return AppendEntriesResult {
                 term: state.current_term,
                 success: false,
+                match_index: 0,
             };
         }
 
@@ -272,6 +295,7 @@ impl NodeRPC for ConnectionHandler {
             return AppendEntriesResult {
                 term: state.current_term,
                 success: false,
+                match_index: 0,
             };
         }
 
@@ -292,9 +316,9 @@ impl NodeRPC for ConnectionHandler {
 
         let last_idx = entries.last().unwrap().0;
 
-        for (idx, t, e) in entries {
-            if state.log.get(idx as usize).is_none() {
-                state.log.push((t, e));
+        for (idx, t, e) in &entries {
+            if state.log.get(*idx as usize).is_none() {
+                state.log.push((*t, e.clone()));
             }
         }
 
@@ -306,6 +330,7 @@ impl NodeRPC for ConnectionHandler {
         AppendEntriesResult {
             term: state.current_term,
             success: true,
+            match_index: prev_log_index + entries.len() as u32,
         }
     }
 
@@ -484,7 +509,14 @@ async fn start_client_server(
 fn start_heartbeats(state: Arc<RaftNode>) {
     let mut interval = time::interval(Duration::from_millis(200));
     let node_id = state.node_id;
-    let clients: Vec<NodeRPCClient> = { state.conns.read().values().cloned().collect() };
+    let clients: HashMap<NodeId, NodeRPCClient> = {
+        state
+            .conns
+            .read()
+            .iter()
+            .map(|(a, b)| (*a, b.clone()))
+            .collect()
+    };
 
     tokio::spawn(async move {
         loop {
@@ -498,9 +530,9 @@ fn start_heartbeats(state: Arc<RaftNode>) {
                     )
                 };
 
-                for client in &clients {
+                for (other_id, client) in &clients {
                     // println!("{} - Sending heartbeat", node_id);
-                    client
+                    let result = client
                         .append_entries(
                             context::current(),
                             node_id,
@@ -508,10 +540,35 @@ fn start_heartbeats(state: Arc<RaftNode>) {
                             node_id,
                             last_log_idx,
                             last_log_term,
-                            vec![],
+                            state.entries_to_send(*other_id),
                             last_log_idx,
                         )
-                        .await;
+                        .await
+                        .unwrap();
+
+                    // TODO: Fan this out, like with the election requests
+
+                    if result.term == state.state.read().current_term {
+                        if result.success {
+                            if let NodeState::Leader(LeaderState {
+                                next_index,
+                                match_index,
+                            }) = state.node_state.write().deref_mut()
+                            {
+                                *next_index.get_mut(other_id).unwrap() += result.match_index + 1;
+                                *match_index.get_mut(other_id).unwrap() += result.match_index;
+                            }
+                        } else {
+                            if let NodeState::Leader(LeaderState {
+                                next_index,
+                                match_index,
+                            }) = state.node_state.write().deref_mut()
+                            {
+                                let mut ni = next_index.get_mut(other_id).unwrap();
+                                *ni = max(ni.saturating_sub(1), 1);
+                            }
+                        }
+                    }
                 }
             }
             interval.tick().await;

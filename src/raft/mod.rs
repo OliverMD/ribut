@@ -35,19 +35,11 @@ impl From<(IpAddr, u16)> for NodeId {
     }
 }
 
-struct AppendEntriesArgs {
-    term: u32,
-    leader_id: NodeId,
-    prev_log_index: u32,
-    prev_log_term: u32,
-    // entries: Vec<LogEntry>,
-    leader_commit: u32,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct AppendEntriesResult {
     term: u32,
     success: bool,
+    match_index: u32,
 }
 
 struct RequestVoteArgs {
@@ -83,7 +75,7 @@ trait NodeRPC {
         leader_id: NodeId,
         prev_log_index: u32,
         prev_log_term: u32,
-        entries: Vec<(u32, u32, LogEntry)>,
+        entries: Vec<(u32, u32, LogEntry)>, // (index, term, entry)
         leader_commit: u32,
     ) -> AppendEntriesResult;
 
