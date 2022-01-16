@@ -31,19 +31,16 @@ enum NodeState {
         response_count: u32,
         vote_count: u32,
     },
-    Leader(LeaderState),
+    Leader {
+        next_index: HashMap<NodeId, u32>,
+        match_index: HashMap<NodeId, u32>,
+    },
 }
 
 impl Default for NodeState {
     fn default() -> Self {
         Follower
     }
-}
-
-#[derive(Default, Clone)]
-struct LeaderState {
-    next_index: HashMap<NodeId, u32>,
-    match_index: HashMap<NodeId, u32>,
 }
 
 #[derive(Default)]
@@ -81,10 +78,10 @@ impl RaftNode {
     }
 
     fn entries_to_send(&self, node_id: NodeId) -> Vec<(u32, u32, LogEntry)> {
-        if let NodeState::Leader(LeaderState {
+        if let NodeState::Leader {
             next_index,
             match_index,
-        }) = self.node_state.read().deref()
+        } = self.node_state.read().deref()
         {
             let next_idx = next_index.get(&node_id).cloned().unwrap_or(0);
             self.state
@@ -186,7 +183,7 @@ impl RaftNode {
                                     ) && vote_count >= self.conn_infos.len() / 2
                                     {
                                         let set_idx: u32 = self.state.read().log.len() as u32;
-                                        *self.node_state.write() = NodeState::Leader(LeaderState {
+                                        *self.node_state.write() = NodeState::Leader {
                                             next_index: self
                                                 .conns
                                                 .read()
@@ -199,7 +196,7 @@ impl RaftNode {
                                                 .keys()
                                                 .map(|n| (*n, 0))
                                                 .collect(),
-                                        });
+                                        };
 
                                         println!("{} - We are now leader", self.node_id);
                                         break; // We are now leader
@@ -231,7 +228,7 @@ impl RaftNode {
                 response_count,
                 vote_count,
             } => {}
-            NodeState::Leader(_) => {
+            NodeState::Leader { .. } => {
                 // Ignore
             }
         };
@@ -520,7 +517,7 @@ fn start_heartbeats(state: Arc<RaftNode>) {
 
     tokio::spawn(async move {
         loop {
-            if matches!(*state.node_state.read(), NodeState::Leader(_)) {
+            if matches!(*state.node_state.read(), NodeState::Leader { .. }) {
                 let (current_term, last_log_idx, last_log_term) = {
                     let state = state.state.read();
                     (
@@ -550,19 +547,19 @@ fn start_heartbeats(state: Arc<RaftNode>) {
 
                     if result.term == state.state.read().current_term {
                         if result.success {
-                            if let NodeState::Leader(LeaderState {
+                            if let NodeState::Leader {
                                 next_index,
                                 match_index,
-                            }) = state.node_state.write().deref_mut()
+                            } = state.node_state.write().deref_mut()
                             {
                                 *next_index.get_mut(other_id).unwrap() += result.match_index + 1;
                                 *match_index.get_mut(other_id).unwrap() += result.match_index;
                             }
                         } else {
-                            if let NodeState::Leader(LeaderState {
+                            if let NodeState::Leader {
                                 next_index,
                                 match_index,
-                            }) = state.node_state.write().deref_mut()
+                            } = state.node_state.write().deref_mut()
                             {
                                 let mut ni = next_index.get_mut(other_id).unwrap();
                                 *ni = max(ni.saturating_sub(1), 1);
@@ -591,7 +588,7 @@ fn start_election_timeout(
                     break;
                 }
                 Err(_) => {
-                    if !matches!(*state.node_state.read(), NodeState::Leader(_)) {
+                    if !matches!(*state.node_state.read(), NodeState::Leader { .. }) {
                         println!("{} - Election timeout hit", state.node_id);
                     }
                     // Election timeout
