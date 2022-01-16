@@ -1,37 +1,37 @@
-use crate::raft::node::NodeState::{Candidate, Follower, Leader};
 use crate::raft::{
+    node::NodeState::{Candidate, Follower},
     AppendEntriesResult, ClientRPC, LogEntry, NodeId, NodeRPC, NodeRPCClient, RequestVoteResult,
 };
-use anyhow::Result;
-use futures::future::{self, Ready};
-use futures::StreamExt;
+use futures::{
+    future::{self, Ready},
+    StreamExt,
+};
 use itertools::Itertools;
-use parking_lot::lock_api::RwLockReadGuard;
-use parking_lot::{RawRwLock, RwLock};
+use parking_lot::RwLock;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
-use std::borrow::Borrow;
-use std::cmp::{max, min};
-use std::collections::HashMap;
-use std::net::IpAddr;
-use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
-use tarpc::server::Channel;
-use tarpc::{client, context, server};
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::time;
-use tokio::time::Duration;
+use std::{
+    cmp::{max, min},
+    collections::HashMap,
+    net::IpAddr,
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
+use tarpc::{client, context, server, server::Channel};
+use tokio::{
+    sync::{
+        mpsc,
+        mpsc::{Receiver, Sender},
+    },
+    time,
+    time::Duration,
+};
 use tokio_serde::formats::Bincode;
 use tokio_stream::{self as stream};
 
 #[derive(Clone, Debug)]
 enum NodeState {
     Follower,
-    Candidate {
-        response_count: u32,
-        vote_count: u32,
-    },
+    Candidate,
     Leader {
         next_index: HashMap<NodeId, u32>,
         match_index: HashMap<NodeId, u32>,
@@ -81,7 +81,7 @@ impl RaftNode {
     fn entries_to_send(&self, node_id: NodeId) -> Vec<(u32, u32, LogEntry)> {
         if let NodeState::Leader {
             next_index,
-            match_index,
+            match_index: _,
         } = self.node_state.read().deref()
         {
             let next_idx = next_index.get(&node_id).cloned().unwrap_or(0);
@@ -95,7 +95,7 @@ impl RaftNode {
                 .map(|(i, (t, e))| (i as u32, *t, e.clone()))
                 .collect();
 
-            if send.len() > 0 {
+            if !send.is_empty() {
                 println!("{} - Sending {:?} to {}", self.node_id, send, node_id);
             }
 
@@ -138,13 +138,9 @@ impl RaftNode {
 
                     println!("{} - We are now a Candidate", self.node_id);
 
-                    *self.node_state.write() = Candidate {
-                        response_count: 0,
-                        vote_count: 0,
-                    };
+                    *self.node_state.write() = Candidate;
                 }
 
-                let mut response_count = 0;
                 let mut vote_count = 0;
 
                 // Send out the requests for votes
@@ -182,11 +178,9 @@ impl RaftNode {
                         Ok(RequestVoteResult { term, vote_granted }) => {
                             if term >= self.state.read().current_term {
                                 if vote_granted {
-                                    response_count += 1;
                                     vote_count += 1;
 
                                     // Check if we can become leader
-
                                     if matches!(
                                         *self.node_state.read(),
                                         NodeState::Candidate { .. }
@@ -214,15 +208,12 @@ impl RaftNode {
                                         println!("{} - We are now Leader", self.node_id);
                                         break; // We are now leader
                                     }
-                                } else {
-                                    response_count += 1;
-                                    if term > self.state.read().current_term {
-                                        self.state.write().current_term = term;
-                                        // Become follower line 404 of spec
-                                        *self.node_state.write() = Follower;
-                                        println!("{} - We are now a Follower", self.node_id);
-                                        break;
-                                    }
+                                } else if term > self.state.read().current_term {
+                                    self.state.write().current_term = term;
+                                    // Become follower line 404 of spec
+                                    *self.node_state.write() = Follower;
+                                    println!("{} - We are now a Follower", self.node_id);
+                                    break;
                                 }
                             } else {
                                 println!(
@@ -338,7 +329,7 @@ impl NodeRPC for ConnectionHandler {
 
         // Go through the new entries and check if there are 2 entries with the same index but mismatched
         // terms.
-        if entries.len() > 0 {
+        if !entries.is_empty() {
             if let Some((idx, _)) = entries.iter().find_position(|(idx, et, _)| {
                 state
                     .log
@@ -377,7 +368,7 @@ impl NodeRPC for ConnectionHandler {
         term: u32,
         candidate_id: NodeId,
         last_log_index: u32,
-        last_log_term: u32,
+        _last_log_term: u32,
     ) -> RequestVoteResult {
         let mut state = self.state.state.write();
 
@@ -585,7 +576,7 @@ fn start_heartbeats(state: Arc<RaftNode>) {
                             match state.node_state.read().deref() {
                                 NodeState::Leader {
                                     next_index,
-                                    match_index,
+                                    match_index: _,
                                 } => Some(*next_index.get(other_id).unwrap()),
                                 _ => None,
                             }
@@ -638,15 +629,13 @@ fn start_heartbeats(state: Arc<RaftNode>) {
                                 *next_index.get_mut(other_id).unwrap() = result.match_index + 1;
                                 *match_index.get_mut(other_id).unwrap() = result.match_index;
                             }
-                        } else {
-                            if let NodeState::Leader {
-                                next_index,
-                                match_index,
-                            } = state.node_state.write().deref_mut()
-                            {
-                                let ni = next_index.get_mut(other_id).unwrap();
-                                *ni = max(ni.saturating_sub(1), 1);
-                            }
+                        } else if let NodeState::Leader {
+                            next_index,
+                            match_index: _,
+                        } = state.node_state.write().deref_mut()
+                        {
+                            let ni = next_index.get_mut(other_id).unwrap();
+                            *ni = max(ni.saturating_sub(1), 1);
                         }
                     }
                 }
@@ -660,7 +649,7 @@ fn start_heartbeats(state: Arc<RaftNode>) {
 
                     let mut new_commit_idx = commit_idx;
                     if let NodeState::Leader {
-                        next_index,
+                        next_index: _,
                         match_index,
                     } = state.node_state.read().deref()
                     {

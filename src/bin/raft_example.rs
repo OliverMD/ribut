@@ -1,6 +1,5 @@
 use futures::future::{self};
-use ribut::raft::node::start_raft_node;
-use ribut::raft::ClientRPCClient;
+use ribut::raft::{node::start_raft_node, ClientRPCClient};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use tarpc::{client, context, tokio_serde::formats::Bincode};
 use tokio::time::Duration;
