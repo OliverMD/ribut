@@ -1,7 +1,7 @@
 use futures::future::{self};
 use ribut::raft::node::start_raft_node;
 use ribut::raft::ClientRPCClient;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use tarpc::{client, context, tokio_serde::formats::Bincode};
 use tokio::time::Duration;
 
@@ -17,11 +17,15 @@ pub async fn main() {
 
     let mut joins = Vec::new();
 
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
     for i in 0u32..2 {
         println!("Creating task {}", i);
         joins.push(tokio::spawn(async move {
-            let transport =
-                tarpc::serde_transport::tcp::connect("localhost:6000", Bincode::default);
+            let transport = tarpc::serde_transport::tcp::connect(
+                SocketAddr::new(LOCAL, 6000 + i as u16),
+                Bincode::default,
+            );
             let client =
                 ClientRPCClient::new(client::Config::default(), transport.await.unwrap()).spawn();
             let resp = client.read_log(context::current()).await;
@@ -37,5 +41,5 @@ pub async fn main() {
 
     future::join_all(joins).await;
 
-    tokio::time::sleep(Duration::from_secs(20)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
 }

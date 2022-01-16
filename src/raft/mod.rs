@@ -42,13 +42,6 @@ struct AppendEntriesResult {
     match_index: u32,
 }
 
-struct RequestVoteArgs {
-    term: u32,
-    candidate_id: NodeId,
-    last_log_index: u32,
-    last_log_term: u32,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct RequestVoteResult {
     term: u32,

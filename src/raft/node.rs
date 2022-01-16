@@ -6,7 +6,8 @@ use anyhow::Result;
 use futures::future::{self, Ready};
 use futures::StreamExt;
 use itertools::Itertools;
-use parking_lot::RwLock;
+use parking_lot::lock_api::RwLockReadGuard;
+use parking_lot::{RawRwLock, RwLock};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
@@ -24,7 +25,7 @@ use tokio::time::Duration;
 use tokio_serde::formats::Bincode;
 use tokio_stream::{self as stream};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum NodeState {
     Follower,
     Candidate {
@@ -84,14 +85,21 @@ impl RaftNode {
         } = self.node_state.read().deref()
         {
             let next_idx = next_index.get(&node_id).cloned().unwrap_or(0);
-            self.state
+            let send: Vec<(u32, u32, LogEntry)> = self
+                .state
                 .read()
                 .log
                 .iter()
                 .enumerate()
-                .skip(next_idx as usize)
+                .skip(next_idx.saturating_sub(1) as usize)
                 .map(|(i, (t, e))| (i as u32, *t, e.clone()))
-                .collect()
+                .collect();
+
+            if send.len() > 0 {
+                println!("{} - Sending {:?} to {}", self.node_id, send, node_id);
+            }
+
+            send
         } else {
             vec![]
         }
@@ -127,6 +135,8 @@ impl RaftNode {
                     let mut state = self.state.write();
                     state.current_term += 1;
                     state.voted_for = Some(self.node_id);
+
+                    println!("{} - We are now a Candidate", self.node_id);
 
                     *self.node_state.write() = Candidate {
                         response_count: 0,
@@ -182,7 +192,10 @@ impl RaftNode {
                                         NodeState::Candidate { .. }
                                     ) && vote_count >= self.conn_infos.len() / 2
                                     {
-                                        let set_idx: u32 = self.state.read().log.len() as u32;
+                                        let set_idx: u32 = self.state.read().log.len() as u32 + 1;
+
+                                        println!("{} - Set idx: {}", self.node_id, set_idx);
+
                                         *self.node_state.write() = NodeState::Leader {
                                             next_index: self
                                                 .conns
@@ -198,7 +211,7 @@ impl RaftNode {
                                                 .collect(),
                                         };
 
-                                        println!("{} - We are now leader", self.node_id);
+                                        println!("{} - We are now Leader", self.node_id);
                                         break; // We are now leader
                                     }
                                 } else {
@@ -207,6 +220,7 @@ impl RaftNode {
                                         self.state.write().current_term = term;
                                         // Become follower line 404 of spec
                                         *self.node_state.write() = Follower;
+                                        println!("{} - We are now a Follower", self.node_id);
                                         break;
                                     }
                                 }
@@ -224,10 +238,7 @@ impl RaftNode {
                     }
                 }
             }
-            NodeState::Candidate {
-                response_count,
-                vote_count,
-            } => {}
+            NodeState::Candidate { .. } => {}
             NodeState::Leader { .. } => {
                 // Ignore
             }
@@ -255,7 +266,18 @@ impl NodeRPC for ConnectionHandler {
         entries: Vec<(u32, u32, LogEntry)>,
         leader_commit: u32,
     ) -> AppendEntriesResult {
-        // println!("{} - Received append entries request", self.state.node_id);
+        // if entries.len() > 0 {
+        println!(
+            "{} - Received append entries request: mterm: {}, ourterm: {}, pre_log_index: {}, pre_log_term: {}, entries: {:?}, leader_commit: {:?}",
+            self.state.node_id,
+            term,
+            self.state.state.read().current_term,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit
+        );
+        // }
 
         let is_from_leader = {
             let state = self.state.state.read();
@@ -273,6 +295,7 @@ impl NodeRPC for ConnectionHandler {
             state.current_term = term;
             {
                 let mut node_state = self.state.node_state.write();
+                println!("{} - We are now a Follower", self.state.node_id);
                 *node_state = Follower;
             }
 
@@ -283,12 +306,26 @@ impl NodeRPC for ConnectionHandler {
             };
         }
 
-        if state
-            .log
-            .get(prev_log_index as usize)
-            .map(|v| v.0 != prev_log_term)
-            .unwrap_or(true)
-        {
+        // LogOk
+        let log_ok = {
+            if prev_log_index == 0 {
+                true
+            } else {
+                prev_log_index <= state.log.len() as u32
+                    && state
+                        .log
+                        .get(prev_log_index as usize - 1) // TODO: Another indexing snafu
+                        .map(|v| v.0 == prev_log_term)
+                        .unwrap_or(false)
+            }
+        };
+
+        if !log_ok {
+            println!(
+                "{} - Rejecting append entries. {:?}",
+                self.state.node_id, state.log
+            );
+
             return AppendEntriesResult {
                 term: state.current_term,
                 success: false,
@@ -301,27 +338,30 @@ impl NodeRPC for ConnectionHandler {
 
         // Go through the new entries and check if there are 2 entries with the same index but mismatched
         // terms.
-        if let Some((idx, _)) = entries.iter().find_position(|(idx, et, _)| {
-            state
-                .log
-                .get(*idx as usize)
-                .map(|(t, _)| *t != *et)
-                .unwrap_or(false)
-        }) {
-            state.log.truncate(idx as usize);
-        }
-
-        let last_idx = entries.last().unwrap().0;
-
-        for (idx, t, e) in &entries {
-            if state.log.get(*idx as usize).is_none() {
-                state.log.push((*t, e.clone()));
+        if entries.len() > 0 {
+            if let Some((idx, _)) = entries.iter().find_position(|(idx, et, _)| {
+                state
+                    .log
+                    .get(*idx as usize)
+                    .map(|(t, _)| *t != *et)
+                    .unwrap_or(false)
+            }) {
+                state.log.truncate(idx as usize);
             }
-        }
 
-        if leader_commit > state.commit_index {
-            state.commit_index = min(leader_commit, last_idx);
-            state.last_applied = state.commit_index;
+            let last_idx = entries.last().unwrap().0;
+
+            for (idx, t, e) in &entries {
+                if state.log.get(*idx as usize).is_none() {
+                    println!("{} - Adding entry {:?}", self.state.node_id, e.clone());
+                    state.log.push((*t, e.clone()));
+                }
+            }
+
+            if leader_commit > state.commit_index {
+                state.commit_index = min(leader_commit, last_idx);
+                state.last_applied = state.commit_index;
+            }
         }
 
         AppendEntriesResult {
@@ -346,6 +386,8 @@ impl NodeRPC for ConnectionHandler {
             state.voted_for = Option::None;
 
             let mut node_state = self.state.node_state.write();
+
+            println!("{} - We are now a Follower", self.state.node_id);
             *node_state = Follower;
         }
 
@@ -377,6 +419,7 @@ impl ClientRPC for ConnectionHandler {
     type ReadLogFut = Ready<Vec<u32>>;
 
     fn read_log(self, _: context::Context) -> Self::ReadLogFut {
+        // TODO: Should we only return committed entries?
         future::ready(
             self.state
                 .state
@@ -392,8 +435,26 @@ impl ClientRPC for ConnectionHandler {
     }
 
     async fn add_entry(self, _: context::Context, entry: u32) {
-        // TODO: Sort this out
-        // self.state.write().log.push((selfLogEntry::Other(entry)));
+        println!(
+            "{} - Self: {:?}",
+            self.state.node_id,
+            self.state.node_state.read().deref()
+        );
+
+        if matches!(
+            self.state.node_state.read().deref(),
+            NodeState::Leader { .. }
+        ) {
+            // println!("Leader got write: {}", entry);
+
+            let current_term = self.state.state.read().current_term;
+
+            self.state
+                .state
+                .write()
+                .log
+                .push((current_term, LogEntry::Other(entry)));
+        }
     }
 }
 
@@ -518,17 +579,38 @@ fn start_heartbeats(state: Arc<RaftNode>) {
     tokio::spawn(async move {
         loop {
             if matches!(*state.node_state.read(), NodeState::Leader { .. }) {
-                let (current_term, last_log_idx, last_log_term) = {
-                    let state = state.state.read();
-                    (
-                        state.current_term,
-                        state.log.len() as u32,
-                        state.log.last().map(|t| t.0).unwrap_or(0),
-                    )
-                };
-
                 for (other_id, client) in &clients {
-                    // println!("{} - Sending heartbeat", node_id);
+                    let (current_term, last_log_idx, last_log_term) = {
+                        let idx_for_node = {
+                            match state.node_state.read().deref() {
+                                NodeState::Leader {
+                                    next_index,
+                                    match_index,
+                                } => Some(*next_index.get(other_id).unwrap()),
+                                _ => None,
+                            }
+                        }
+                        .unwrap()
+                            - 1;
+
+                        println!("idx for node: {}", idx_for_node);
+
+                        let state = state.state.read();
+                        (
+                            state.current_term,
+                            idx_for_node, // TODO: This needs to be fixed with indexing...
+                            if idx_for_node > 0 {
+                                state
+                                    .log
+                                    .get(idx_for_node as usize - 1) // TODO: This is an instance where the indexing could get messed up
+                                    .map(|t| t.0)
+                                    .unwrap_or(0)
+                            } else {
+                                0
+                            },
+                        )
+                    };
+
                     let result = client
                         .append_entries(
                             context::current(),
@@ -538,13 +620,14 @@ fn start_heartbeats(state: Arc<RaftNode>) {
                             last_log_idx,
                             last_log_term,
                             state.entries_to_send(*other_id),
-                            last_log_idx,
+                            last_log_idx, // TODO: This is clearly wrong
                         )
                         .await
                         .unwrap();
 
                     // TODO: Fan this out, like with the election requests
 
+                    println!("Resp {:?}", result);
                     if result.term == state.state.read().current_term {
                         if result.success {
                             if let NodeState::Leader {
@@ -552,8 +635,8 @@ fn start_heartbeats(state: Arc<RaftNode>) {
                                 match_index,
                             } = state.node_state.write().deref_mut()
                             {
-                                *next_index.get_mut(other_id).unwrap() += result.match_index + 1;
-                                *match_index.get_mut(other_id).unwrap() += result.match_index;
+                                *next_index.get_mut(other_id).unwrap() = result.match_index + 1;
+                                *match_index.get_mut(other_id).unwrap() = result.match_index;
                             }
                         } else {
                             if let NodeState::Leader {
@@ -561,12 +644,58 @@ fn start_heartbeats(state: Arc<RaftNode>) {
                                 match_index,
                             } = state.node_state.write().deref_mut()
                             {
-                                let mut ni = next_index.get_mut(other_id).unwrap();
+                                let ni = next_index.get_mut(other_id).unwrap();
                                 *ni = max(ni.saturating_sub(1), 1);
                             }
                         }
                     }
                 }
+
+                // AdvanceCommitIndex
+                // We need to find the maximum matchIndex that is on at least 50% of nodes and that index
+                // needs to have the same term as the current term
+
+                let new_commit_idx = {
+                    let commit_idx = state.state.read().commit_index;
+
+                    let mut new_commit_idx = commit_idx;
+                    if let NodeState::Leader {
+                        next_index,
+                        match_index,
+                    } = state.node_state.read().deref()
+                    {
+                        println!(
+                            "low: {}, high: {}",
+                            commit_idx,
+                            state.state.read().log.len()
+                        );
+                        for idx in commit_idx..state.state.read().log.len() as u32 {
+                            let a = match_index.values().filter(|&&i| i >= idx as u32).count();
+                            let b = (match_index.len() + 1) / 2;
+
+                            println!("a: {} - b: {}", a, b);
+
+                            if a > b
+                            // TODO: This almost certainly wrong. Come up with better quorum solution
+                            {
+                                new_commit_idx = idx;
+                            }
+                        }
+
+                        if new_commit_idx != commit_idx {
+                            println!(
+                                "commit_index changed from {} to {}",
+                                commit_idx, new_commit_idx
+                            )
+                        }
+
+                        new_commit_idx
+                    } else {
+                        panic!("Not in leader state") // TODO: I think this can sometimes happen
+                    }
+                };
+
+                state.state.write().commit_index = new_commit_idx;
             }
             interval.tick().await;
         }
