@@ -1,8 +1,121 @@
+use crate::raft::ClientRPCClient;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::net::SocketAddr;
+use tarpc::client;
+use tarpc::client::RpcError;
+use tarpc::context::Context;
+use tokio_serde::formats::Bincode;
 
-#[derive(Serialize, Deserialize)]
-pub(crate) enum Response {
-    Leader(SocketAddr),
-    Log(Vec<u32>),
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Response<T> {
+    NotLeader(Option<SocketAddr>),
+    Ok(T),
+}
+
+impl<T> Response<T> {
+    pub fn unwrap(self) -> T {
+        match self {
+            Response::Ok(val) => val,
+            Response::NotLeader(_) => panic!("called `Response::unwrap()` on a `NotLeader` value"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Client {
+    rpc_client: Option<ClientRPCClient>,
+    seeds: Vec<SocketAddr>,
+}
+
+impl Client {
+    pub fn new(seeds: Vec<SocketAddr>) -> Client {
+        // TODO: Add Result and deal with invalid inputs
+        Client {
+            rpc_client: Option::None,
+            seeds,
+        }
+    }
+
+    pub async fn read(&mut self) -> Option<Vec<u32>> {
+        self.perform(|client| async move { client.read_log(Context::current()).await })
+            .await
+    }
+
+    pub async fn write_val(&mut self, val: u32) -> Option<()> {
+        self.perform(|client| async move { client.add_entry(Context::current(), val).await })
+            .await
+    }
+
+    async fn perform<A, R, Fut>(&mut self, action: A) -> Option<R>
+    where
+        A: Fn(ClientRPCClient) -> Fut,
+        Fut: Future<Output = Result<Response<R>, RpcError>>,
+    {
+        // If contacting all the seeds still results in no leader then give up
+        // TODO: Assumption that all nodes are in seeds
+        let client = self.get_or_fetch_leader().await?;
+
+        match action(client).await {
+            Ok(Response::Ok(val)) => return Some(val),
+            Ok(Response::NotLeader(_)) => {
+                // TODO: Add logic to connect to leader
+                self.rpc_client = None;
+            }
+            Err(err) => {
+                println!("RPC Error {}", err);
+                self.rpc_client = None;
+            }
+        }
+
+        None
+    }
+
+    /// Gets our latest view of the leader
+    async fn get_or_fetch_leader(&mut self) -> Option<ClientRPCClient> {
+        if let Some(leader) = &self.rpc_client {
+            Some(leader.clone())
+        } else {
+            self.rpc_client = self.client_from_seeds().await;
+            self.rpc_client.clone()
+        }
+    }
+
+    /// Contacts all seeds to try and find a leader
+    async fn client_from_seeds(&self) -> Option<ClientRPCClient> {
+        Box::pin(
+            // TODO: Figure out why we need to clone these seeds
+            tokio_stream::iter(self.seeds.clone())
+                .map(|saddr| async move {
+                    if let Some(client) = Client::try_connect(saddr).await {
+                        let resp = client
+                            .leader(Context::current())
+                            .await
+                            .ok()
+                            .map(|resp| match resp {
+                                // Ignore the leader suggestion as we could be contacting it as part of this stream
+                                // TODO: There's an assumption here that we know all the seeds upfront
+                                Response::NotLeader(_) => None,
+                                Response::Ok(_) => Some(client),
+                            })
+                            .flatten();
+                        resp
+                    } else {
+                        None
+                    }
+                })
+                .buffer_unordered(self.seeds.len()),
+        )
+        .next()
+        .await
+        .flatten()
+    }
+
+    async fn try_connect(node: SocketAddr) -> Option<ClientRPCClient> {
+        let transport = tarpc::serde_transport::tcp::connect(node, Bincode::default);
+
+        let client = ClientRPCClient::new(client::Config::default(), transport.await.ok()?).spawn();
+        Some(client)
+    }
 }

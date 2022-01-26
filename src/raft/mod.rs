@@ -1,6 +1,7 @@
 pub mod client;
 pub mod node;
 
+use crate::raft::client::Response;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::hash_map::DefaultHasher,
@@ -49,8 +50,11 @@ enum LogEntry {
 
 #[tarpc::service]
 pub trait ClientRPC {
-    async fn read_log() -> Vec<u32>;
-    async fn add_entry(entry: u32);
+    async fn read_log() -> Response<Vec<u32>>;
+    async fn add_entry(entry: u32) -> Response<()>;
+
+    /// Returns Ok(()) iff it is the leader. NotLeader(leader) otherwise
+    async fn leader() -> Response<()>;
 }
 
 #[tarpc::service]

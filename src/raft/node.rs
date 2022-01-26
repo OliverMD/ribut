@@ -1,14 +1,16 @@
+use crate::raft::client::Response;
 use crate::raft::{
     node::NodeState::{Candidate, Follower},
     AppendEntriesResult, ClientRPC, LogEntry, NodeId, NodeRPC, NodeRPCClient, RequestVoteResult,
 };
 use futures::{
-    future::{self, Ready},
+    future::{self},
     StreamExt,
 };
 use itertools::Itertools;
 use parking_lot::RwLock;
 use rand::Rng;
+use std::net::SocketAddr;
 use std::{
     cmp::{max, min},
     collections::HashMap,
@@ -16,6 +18,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
 };
+use tarpc::context::Context;
 use tarpc::{client, context, server, server::Channel};
 use tokio::{
     sync::{
@@ -62,7 +65,7 @@ struct GeneralState {
 pub struct RaftNode {
     state: RwLock<GeneralState>,
     node_state: RwLock<NodeState>,
-    conn_infos: Vec<(IpAddr, u16)>,
+    conn_infos: HashMap<NodeId, (IpAddr, u16)>,
     conns: RwLock<HashMap<NodeId, NodeRPCClient>>, // TODO: Can we do better?
     node_id: NodeId,
 }
@@ -72,7 +75,10 @@ impl RaftNode {
         Self {
             state: RwLock::new(Default::default()),
             node_state: RwLock::new(Default::default()),
-            conn_infos,
+            conn_infos: conn_infos
+                .iter()
+                .map(|ip_port| (NodeId::from(*ip_port), *ip_port))
+                .collect(),
             conns: RwLock::new(HashMap::new()),
             node_id,
         }
@@ -106,11 +112,10 @@ impl RaftNode {
     }
 
     async fn connect(&self) {
-        for (ip, port) in &self.conn_infos {
+        for (node_id, ip_port) in &self.conn_infos {
             let transport = {
                 loop {
-                    let transport =
-                        tarpc::serde_transport::tcp::connect((*ip, *port), Bincode::default);
+                    let transport = tarpc::serde_transport::tcp::connect(ip_port, Bincode::default);
                     match transport.await {
                         Ok(res) => break res,
                         Err(e) => println!("[{}] - {}", self.node_id, e),
@@ -121,14 +126,13 @@ impl RaftNode {
             };
 
             let client = NodeRPCClient::new(client::Config::default(), transport).spawn();
-            self.conns
-                .write()
-                .insert(NodeId::from((*ip, *port)), client);
+            self.conns.write().insert(*node_id, client);
         }
     }
 
     async fn handle_election_timout(&self) {
         let current_node_state = self.node_state.read().clone();
+        self.state.write().leader_id = None;
         match current_node_state {
             Follower => {
                 {
@@ -204,6 +208,8 @@ impl RaftNode {
                                                 .map(|n| (*n, 0))
                                                 .collect(),
                                         };
+
+                                        self.state.write().leader_id = Some(self.node_id);
 
                                         println!("{} - We are now Leader", self.node_id);
                                         break; // We are now leader
@@ -407,12 +413,12 @@ impl NodeRPC for ConnectionHandler {
 
 #[tarpc::server]
 impl ClientRPC for ConnectionHandler {
-    type ReadLogFut = Ready<Vec<u32>>;
-
-    fn read_log(self, _: context::Context) -> Self::ReadLogFut {
+    async fn read_log(self, _: context::Context) -> Response<Vec<u32>> {
         // TODO: Should we only return committed entries?
-        future::ready(
-            self.state
+
+        if matches!(*self.state.node_state.read(), NodeState::Leader { .. }) {
+            let ret: Vec<u32> = self
+                .state
                 .state
                 .read()
                 .log
@@ -421,23 +427,19 @@ impl ClientRPC for ConnectionHandler {
                     LogEntry::Config => None,
                     LogEntry::Other(x) => Some(*x),
                 })
-                .collect(),
-        )
+                .collect();
+
+            Response::Ok(ret)
+        } else {
+            Response::NotLeader(self.leader_conn_info())
+        }
     }
 
-    async fn add_entry(self, _: context::Context, entry: u32) {
-        println!(
-            "{} - Self: {:?}",
-            self.state.node_id,
-            self.state.node_state.read().deref()
-        );
-
+    async fn add_entry(self, _: context::Context, entry: u32) -> Response<()> {
         if matches!(
             self.state.node_state.read().deref(),
             NodeState::Leader { .. }
         ) {
-            // println!("Leader got write: {}", entry);
-
             let current_term = self.state.state.read().current_term;
 
             self.state
@@ -445,7 +447,29 @@ impl ClientRPC for ConnectionHandler {
                 .write()
                 .log
                 .push((current_term, LogEntry::Other(entry)));
+
+            Response::Ok(())
+        } else {
+            Response::NotLeader(self.leader_conn_info())
         }
+    }
+
+    async fn leader(self, _context: Context) -> Response<()> {
+        if matches!(*self.state.node_state.read(), NodeState::Leader { .. }) {
+            Response::Ok(())
+        } else {
+            Response::NotLeader(self.leader_conn_info())
+        }
+    }
+}
+
+impl ConnectionHandler {
+    fn leader_conn_info(&self) -> Option<SocketAddr> {
+        self.state
+            .state
+            .read()
+            .leader_id
+            .map(|node_id| SocketAddr::from(*self.state.conn_infos.get(&node_id).unwrap()))
     }
 }
 
@@ -581,7 +605,7 @@ fn start_heartbeats(state: Arc<RaftNode>) {
                                 _ => None,
                             }
                         }
-                        .unwrap()
+                        .unwrap() // TODO: Handle None case
                             - 1;
 
                         println!("idx for node: {}", idx_for_node);
