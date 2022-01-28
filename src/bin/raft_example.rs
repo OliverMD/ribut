@@ -1,4 +1,6 @@
+use env_logger::Builder;
 use futures::future::{self};
+use log::LevelFilter;
 use ribut::raft::client::Client;
 use ribut::raft::node::start_raft_node;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -6,6 +8,11 @@ use tokio::time::Duration;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 pub async fn main() {
+    Builder::new()
+        .filter_level(LevelFilter::Info)
+        .filter_module("tarpc", LevelFilter::Error)
+        .init();
+
     const LOCAL: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
     let node_a = tokio::spawn(async {
         start_raft_node(LOCAL, 6000, 7000, vec![(LOCAL, 7001), (LOCAL, 7002)]).await

@@ -8,6 +8,7 @@ use futures::{
     StreamExt,
 };
 use itertools::Itertools;
+use log::{debug, error, info, warn};
 use parking_lot::RwLock;
 use rand::Rng;
 use std::net::SocketAddr;
@@ -102,7 +103,7 @@ impl RaftNode {
                 .collect();
 
             if !send.is_empty() {
-                println!("{} - Sending {:?} to {}", self.node_id, send, node_id);
+                debug!("{} - Sending {:?} to {}", self.node_id, send, node_id);
             }
 
             send
@@ -118,7 +119,10 @@ impl RaftNode {
                     let transport = tarpc::serde_transport::tcp::connect(ip_port, Bincode::default);
                     match transport.await {
                         Ok(res) => break res,
-                        Err(e) => println!("[{}] - {}", self.node_id, e),
+                        Err(e) => error!(
+                            "{} - Error connection to {:?}: {}",
+                            self.node_id, ip_port, e
+                        ),
                     }
 
                     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -140,7 +144,7 @@ impl RaftNode {
                     state.current_term += 1;
                     state.voted_for = Some(self.node_id);
 
-                    println!("{} - We are now a Candidate", self.node_id);
+                    info!("{} - State change to Candidate", self.node_id);
 
                     *self.node_state.write() = Candidate;
                 }
@@ -192,7 +196,7 @@ impl RaftNode {
                                     {
                                         let set_idx: u32 = self.state.read().log.len() as u32 + 1;
 
-                                        println!("{} - Set idx: {}", self.node_id, set_idx);
+                                        debug!("{} - Set idx: {}", self.node_id, set_idx);
 
                                         *self.node_state.write() = NodeState::Leader {
                                             next_index: self
@@ -211,31 +215,35 @@ impl RaftNode {
 
                                         self.state.write().leader_id = Some(self.node_id);
 
-                                        println!("{} - We are now Leader", self.node_id);
+                                        info!("{} - State change to leader Leader", self.node_id);
                                         break; // We are now leader
                                     }
                                 } else if term > self.state.read().current_term {
                                     self.state.write().current_term = term;
                                     // Become follower line 404 of spec
                                     *self.node_state.write() = Follower;
-                                    println!("{} - We are now a Follower", self.node_id);
+                                    info!("{} - State change to Follower", self.node_id);
                                     break;
                                 }
                             } else {
-                                println!(
-                                    "{} - Ignoring response due to outdated term",
-                                    self.node_id
+                                warn!(
+                                    "{} - Ignoring request vote response due to outdated term {}",
+                                    self.node_id, term
                                 )
                             }
                         }
                         Err(e) => {
-                            // TODO: Retry? Or Logging? Does tarpc retry?
-                            println!("Received error send request vote: {}", e)
+                            error!(
+                                "{} - Received error from send request vote: {}",
+                                self.node_id, e
+                            )
                         }
                     }
                 }
             }
-            NodeState::Candidate { .. } => {}
+            NodeState::Candidate { .. } => {
+                // Ignore
+            }
             NodeState::Leader { .. } => {
                 // Ignore
             }
@@ -264,7 +272,7 @@ impl NodeRPC for ConnectionHandler {
         leader_commit: u32,
     ) -> AppendEntriesResult {
         // if entries.len() > 0 {
-        println!(
+        debug!(
             "{} - Received append entries request: mterm: {}, ourterm: {}, pre_log_index: {}, pre_log_term: {}, entries: {:?}, leader_commit: {:?}",
             self.state.node_id,
             term,
@@ -292,7 +300,7 @@ impl NodeRPC for ConnectionHandler {
             state.current_term = term;
             {
                 let mut node_state = self.state.node_state.write();
-                println!("{} - We are now a Follower", self.state.node_id);
+                info!("{} - State change to Follower", self.state.node_id);
                 *node_state = Follower;
             }
 
@@ -318,7 +326,7 @@ impl NodeRPC for ConnectionHandler {
         };
 
         if !log_ok {
-            println!(
+            warn!(
                 "{} - Rejecting append entries. {:?}",
                 self.state.node_id, state.log
             );
@@ -350,7 +358,7 @@ impl NodeRPC for ConnectionHandler {
 
             for (idx, t, e) in &entries {
                 if state.log.get(*idx as usize).is_none() {
-                    println!("{} - Adding entry {:?}", self.state.node_id, e.clone());
+                    debug!("{} - Adding entry {:?}", self.state.node_id, e.clone());
                     state.log.push((*t, e.clone()));
                 }
             }
@@ -384,7 +392,7 @@ impl NodeRPC for ConnectionHandler {
 
             let mut node_state = self.state.node_state.write();
 
-            println!("{} - We are now a Follower", self.state.node_id);
+            info!("{} - State change to Follower", self.state.node_id);
             *node_state = Follower;
         }
 
@@ -402,7 +410,7 @@ impl NodeRPC for ConnectionHandler {
             vote_granted,
         };
 
-        println!(
+        debug!(
             "{} - Sending Request vote response to {} - {:?}",
             self.state.node_id, candidate_id, res
         );
@@ -484,7 +492,7 @@ pub async fn start_raft_node(
     let election_timeout = Duration::from_millis(1000 + rand::thread_rng().gen_range(0..250));
     let (heartbeat_tx, election_rx) = mpsc::channel(10);
 
-    println!("{} - Starting node server", node_id);
+    info!("{} - Starting node server", node_id);
 
     start_node_server(
         state.clone(),
@@ -494,15 +502,15 @@ pub async fn start_raft_node(
     )
     .await;
 
-    println!("{} - Connecting to other nodes", node_id);
+    info!("{} - Connecting to other nodes", node_id);
 
     state.connect().await;
 
-    println!("{} - Starting heartbeats", node_id);
+    info!("{} - Starting heartbeats", node_id);
     start_heartbeats(state.clone());
-    println!("{} - Starting election timeout", node_id);
+    info!("{} - Starting election timeout", node_id);
     start_election_timeout(state.clone(), election_timeout, election_rx);
-    println!("{} - Starting client server", node_id);
+    info!("{} - Starting client server", node_id);
     start_client_server(
         state.clone(),
         heartbeat_tx.clone(),
@@ -511,7 +519,7 @@ pub async fn start_raft_node(
     )
     .await;
 
-    println!("{} - Node startup complete", node_id);
+    info!("{} - Node startup complete", node_id);
 }
 
 async fn start_node_server(
@@ -608,7 +616,7 @@ fn start_heartbeats(state: Arc<RaftNode>) {
                         .unwrap() // TODO: Handle None case
                             - 1;
 
-                        println!("idx for node: {}", idx_for_node);
+                        debug!("{} - idx for node: {}", state.node_id, idx_for_node);
 
                         let state = state.state.read();
                         (
@@ -642,7 +650,7 @@ fn start_heartbeats(state: Arc<RaftNode>) {
 
                     // TODO: Fan this out, like with the election requests
 
-                    println!("Resp {:?}", result);
+                    debug!("{} - Heartbeat response: {:?}", node_id, result);
                     if result.term == state.state.read().current_term {
                         if result.success {
                             if let NodeState::Leader {
@@ -677,16 +685,9 @@ fn start_heartbeats(state: Arc<RaftNode>) {
                         match_index,
                     } = state.node_state.read().deref()
                     {
-                        println!(
-                            "low: {}, high: {}",
-                            commit_idx,
-                            state.state.read().log.len()
-                        );
                         for idx in commit_idx..state.state.read().log.len() as u32 {
                             let a = match_index.values().filter(|&&i| i >= idx as u32).count();
                             let b = (match_index.len() + 1) / 2;
-
-                            println!("a: {} - b: {}", a, b);
 
                             if a > b
                             // TODO: This almost certainly wrong. Come up with better quorum solution
@@ -696,9 +697,9 @@ fn start_heartbeats(state: Arc<RaftNode>) {
                         }
 
                         if new_commit_idx != commit_idx {
-                            println!(
-                                "commit_index changed from {} to {}",
-                                commit_idx, new_commit_idx
+                            info!(
+                                "{} - commit_index changed from {} to {}",
+                                state.node_id, commit_idx, new_commit_idx
                             )
                         }
 
@@ -731,7 +732,7 @@ fn start_election_timeout(
                 }
                 Err(_) => {
                     if !matches!(*state.node_state.read(), NodeState::Leader { .. }) {
-                        println!("{} - Election timeout hit", state.node_id);
+                        info!("{} - Election timeout hit", state.node_id);
                     }
                     // Election timeout
                     // TODO: Do we want to await here or continue the timeout tracking, should
