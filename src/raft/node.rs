@@ -92,6 +92,12 @@ impl RaftNode {
         } = self.node_state.read().deref()
         {
             let next_idx = next_index.get(&node_id).cloned().unwrap_or(0);
+
+            debug!(
+                "{} - Next index for {} is {}",
+                self.node_id, node_id, next_idx
+            );
+
             let send: Vec<(u32, u32, LogEntry)> = self
                 .state
                 .read()
@@ -425,11 +431,8 @@ impl ClientRPC for ConnectionHandler {
         // TODO: Should we only return committed entries?
 
         if matches!(*self.state.node_state.read(), NodeState::Leader { .. }) {
-            let ret: Vec<u32> = self
-                .state
-                .state
-                .read()
-                .log
+            let ret: Vec<u32> = self.state.state.read().log
+                [0..=self.state.state.read().commit_index as usize]
                 .iter()
                 .filter_map(|(_, e)| match e {
                     LogEntry::Config => None,
@@ -464,8 +467,10 @@ impl ClientRPC for ConnectionHandler {
 
     async fn leader(self, _context: Context) -> Response<()> {
         if matches!(*self.state.node_state.read(), NodeState::Leader { .. }) {
+            debug!("{} - leader - we are leader", self.state.node_id);
             Response::Ok(())
         } else {
+            debug!("{} - leader - not leader", self.state.node_id);
             Response::NotLeader(self.leader_conn_info())
         }
     }
@@ -473,6 +478,8 @@ impl ClientRPC for ConnectionHandler {
 
 impl ConnectionHandler {
     fn leader_conn_info(&self) -> Option<SocketAddr> {
+        // TODO: This is wrong, it returns the port used for node comms rather than client comms
+
         self.state
             .state
             .read()
@@ -616,7 +623,10 @@ fn start_heartbeats(state: Arc<RaftNode>) {
                         .unwrap() // TODO: Handle None case
                             - 1;
 
-                        debug!("{} - idx for node: {}", state.node_id, idx_for_node);
+                        debug!(
+                            "{} - idx for node {}: {}",
+                            state.node_id, other_id, idx_for_node
+                        );
 
                         let state = state.state.read();
                         (

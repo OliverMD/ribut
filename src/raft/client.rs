@@ -1,5 +1,6 @@
 use crate::raft::ClientRPCClient;
 use futures::StreamExt;
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -61,10 +62,11 @@ impl Client {
             Ok(Response::Ok(val)) => return Some(val),
             Ok(Response::NotLeader(_)) => {
                 // TODO: Add logic to connect to leader
+                info!("Not leader received");
                 self.rpc_client = None;
             }
             Err(err) => {
-                println!("RPC Error {}", err);
+                error!("RPC Error {}", err);
                 self.rpc_client = None;
             }
         }
@@ -84,20 +86,25 @@ impl Client {
 
     /// Contacts all seeds to try and find a leader
     async fn client_from_seeds(&self) -> Option<ClientRPCClient> {
-        Box::pin(
+        let leader = Box::pin(
             // TODO: Figure out why we need to clone these seeds
             tokio_stream::iter(self.seeds.clone())
                 .map(|saddr| async move {
                     if let Some(client) = Client::try_connect(saddr).await {
+                        debug!("Sending leader quest to {}", saddr);
                         let resp = client
                             .leader(Context::current())
                             .await
                             .ok()
-                            .map(|resp| match resp {
-                                // Ignore the leader suggestion as we could be contacting it as part of this stream
-                                // TODO: There's an assumption here that we know all the seeds upfront
-                                Response::NotLeader(_) => None,
-                                Response::Ok(_) => Some(client),
+                            .map(|resp| {
+                                debug!("Leader response: {:?}", resp);
+
+                                match resp {
+                                    // Ignore the leader suggestion as we could be contacting it as part of this stream
+                                    // TODO: There's an assumption here that we know all the seeds upfront
+                                    Response::NotLeader(_) => None,
+                                    Response::Ok(_) => Some(client),
+                                }
                             })
                             .flatten();
                         resp
@@ -107,9 +114,16 @@ impl Client {
                 })
                 .buffer_unordered(self.seeds.len()),
         )
+        .filter(|a| futures::future::ready(a.is_some()))
         .next()
         .await
-        .flatten()
+        .flatten();
+
+        if leader.is_none() {
+            warn!("Unable to find leader from seeds!");
+        }
+
+        leader
     }
 
     async fn try_connect(node: SocketAddr) -> Option<ClientRPCClient> {
