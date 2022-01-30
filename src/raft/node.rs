@@ -69,10 +69,15 @@ pub struct RaftNode {
     conn_infos: HashMap<NodeId, (IpAddr, u16)>,
     conns: RwLock<HashMap<NodeId, NodeRPCClient>>, // TODO: Can we do better?
     node_id: NodeId,
+    election_timeout_handler: Sender<()>,
 }
 
 impl RaftNode {
-    fn new(node_id: NodeId, conn_infos: Vec<(IpAddr, u16)>) -> Self {
+    fn new(
+        node_id: NodeId,
+        conn_infos: Vec<(IpAddr, u16)>,
+        election_timeout_handler: Sender<()>,
+    ) -> Self {
         Self {
             state: RwLock::new(Default::default()),
             node_state: RwLock::new(Default::default()),
@@ -82,6 +87,7 @@ impl RaftNode {
                 .collect(),
             conns: RwLock::new(HashMap::new()),
             node_id,
+            election_timeout_handler,
         }
     }
 
@@ -256,22 +262,6 @@ impl RaftNode {
         };
     }
 
-    async fn read_log(&self) -> Response<Vec<u32>> {
-        if matches!(*self.node_state.read(), NodeState::Leader { .. }) {
-            let ret: Vec<u32> = self.state.read().log[0..=self.state.read().commit_index as usize]
-                .iter()
-                .filter_map(|(_, e)| match e {
-                    LogEntry::Config => None,
-                    LogEntry::Other(x) => Some(*x),
-                })
-                .collect();
-
-            Response::Ok(ret)
-        } else {
-            Response::NotLeader(self.leader_conn_info())
-        }
-    }
-
     fn leader_conn_info(&self) -> Option<SocketAddr> {
         // TODO: This is wrong, it returns the port used for node comms rather than client comms
 
@@ -280,42 +270,10 @@ impl RaftNode {
             .leader_id
             .map(|node_id| SocketAddr::from(*self.conn_infos.get(&node_id).unwrap()))
     }
-
-    async fn add_entry(&self, entry: u32) -> Response<()> {
-        if matches!(self.node_state.read().deref(), NodeState::Leader { .. }) {
-            let current_term = self.state.read().current_term;
-
-            self.state
-                .write()
-                .log
-                .push((current_term, LogEntry::Other(entry)));
-
-            Response::Ok(())
-        } else {
-            Response::NotLeader(self.leader_conn_info())
-        }
-    }
-
-    async fn leader(&self) -> Response<()> {
-        if matches!(*self.node_state.read(), NodeState::Leader { .. }) {
-            debug!("{} - leader - we are leader", self.node_id);
-            Response::Ok(())
-        } else {
-            debug!("{} - leader - not leader", self.node_id);
-            Response::NotLeader(self.leader_conn_info())
-        }
-    }
-}
-
-// Created for each inbound connection with another node
-#[derive(Clone)]
-pub struct ConnectionHandler {
-    state: Arc<RaftNode>,
-    election_timeout_handler: Sender<()>,
 }
 
 #[tarpc::server]
-impl NodeRPC for ConnectionHandler {
+impl NodeRPC for Arc<RaftNode> {
     async fn append_entries(
         self,
         _: context::Context,
@@ -330,9 +288,9 @@ impl NodeRPC for ConnectionHandler {
         // if entries.len() > 0 {
         debug!(
             "{} - Received append entries request: mterm: {}, ourterm: {}, pre_log_index: {}, pre_log_term: {}, entries: {:?}, leader_commit: {:?}",
-            self.state.node_id,
+            self.node_id,
             term,
-            self.state.state.read().current_term,
+            self.state.read().current_term,
             prev_log_index,
             prev_log_term,
             entries,
@@ -341,7 +299,7 @@ impl NodeRPC for ConnectionHandler {
         // }
 
         let is_from_leader = {
-            let state = self.state.state.read();
+            let state = self.state.read();
             state.leader_id.map(|l| l == from).unwrap_or(false)
                 || (term >= state.current_term && leader_id == from)
         };
@@ -350,13 +308,13 @@ impl NodeRPC for ConnectionHandler {
             self.election_timeout_handler.send(()).await.unwrap();
         }
 
-        let mut state = self.state.state.write();
+        let mut state = self.state.write();
 
         if term < state.current_term {
             state.current_term = term;
             {
-                let mut node_state = self.state.node_state.write();
-                info!("{} - State change to Follower", self.state.node_id);
+                let mut node_state = self.node_state.write();
+                info!("{} - State change to Follower", self.node_id);
                 *node_state = Follower;
             }
 
@@ -384,7 +342,7 @@ impl NodeRPC for ConnectionHandler {
         if !log_ok {
             warn!(
                 "{} - Rejecting append entries. {:?}",
-                self.state.node_id, state.log
+                self.node_id, state.log
             );
 
             return AppendEntriesResult {
@@ -414,7 +372,7 @@ impl NodeRPC for ConnectionHandler {
 
             for (idx, t, e) in &entries {
                 if state.log.get(*idx as usize).is_none() {
-                    debug!("{} - Adding entry {:?}", self.state.node_id, e.clone());
+                    debug!("{} - Adding entry {:?}", self.node_id, e.clone());
                     state.log.push((*t, e.clone()));
                 }
             }
@@ -440,15 +398,15 @@ impl NodeRPC for ConnectionHandler {
         last_log_index: u32,
         _last_log_term: u32,
     ) -> RequestVoteResult {
-        let mut state = self.state.state.write();
+        let mut state = self.state.write();
 
         if term > state.current_term {
             state.current_term = term;
             state.voted_for = Option::None;
 
-            let mut node_state = self.state.node_state.write();
+            let mut node_state = self.node_state.write();
 
-            info!("{} - State change to Follower", self.state.node_id);
+            info!("{} - State change to Follower", self.node_id);
             *node_state = Follower;
         }
 
@@ -468,7 +426,7 @@ impl NodeRPC for ConnectionHandler {
 
         debug!(
             "{} - Sending Request vote response to {} - {:?}",
-            self.state.node_id, candidate_id, res
+            self.node_id, candidate_id, res
         );
 
         res
@@ -476,17 +434,46 @@ impl NodeRPC for ConnectionHandler {
 }
 
 #[tarpc::server]
-impl ClientRPC for ConnectionHandler {
+impl ClientRPC for Arc<RaftNode> {
     async fn read_log(self, _: context::Context) -> Response<Vec<u32>> {
-        self.state.read_log().await
+        if matches!(*self.node_state.read(), NodeState::Leader { .. }) {
+            let ret: Vec<u32> = self.state.read().log[0..=self.state.read().commit_index as usize]
+                .iter()
+                .filter_map(|(_, e)| match e {
+                    LogEntry::Config => None,
+                    LogEntry::Other(x) => Some(*x),
+                })
+                .collect();
+
+            Response::Ok(ret)
+        } else {
+            Response::NotLeader(self.leader_conn_info())
+        }
     }
 
     async fn add_entry(self, _: context::Context, entry: u32) -> Response<()> {
-        self.state.add_entry(entry).await
+        if matches!(self.node_state.read().deref(), NodeState::Leader { .. }) {
+            let current_term = self.state.read().current_term;
+
+            self.state
+                .write()
+                .log
+                .push((current_term, LogEntry::Other(entry)));
+
+            Response::Ok(())
+        } else {
+            Response::NotLeader(self.leader_conn_info())
+        }
     }
 
     async fn leader(self, _context: Context) -> Response<()> {
-        self.state.leader().await
+        if matches!(*self.node_state.read(), NodeState::Leader { .. }) {
+            debug!("{} - leader - we are leader", self.node_id);
+            Response::Ok(())
+        } else {
+            debug!("{} - leader - not leader", self.node_id);
+            Response::NotLeader(self.leader_conn_info())
+        }
     }
 }
 
@@ -497,19 +484,13 @@ pub async fn start_raft_node(
     others: Vec<(IpAddr, u16)>,
 ) {
     let node_id = (bind_addr, node_bind_port).into();
-    let state = Arc::new(RaftNode::new(node_id, others));
     let election_timeout = Duration::from_millis(1000 + rand::thread_rng().gen_range(0..250));
     let (heartbeat_tx, election_rx) = mpsc::channel(10);
+    let state = Arc::new(RaftNode::new(node_id, others, heartbeat_tx));
 
     info!("{} - Starting node server", node_id);
 
-    start_node_server(
-        state.clone(),
-        heartbeat_tx.clone(),
-        bind_addr,
-        node_bind_port,
-    )
-    .await;
+    start_node_server(state.clone(), bind_addr, node_bind_port).await;
 
     info!("{} - Connecting to other nodes", node_id);
 
@@ -520,23 +501,12 @@ pub async fn start_raft_node(
     info!("{} - Starting election timeout", node_id);
     start_election_timeout(state.clone(), election_timeout, election_rx);
     info!("{} - Starting client server", node_id);
-    start_client_server(
-        state.clone(),
-        heartbeat_tx.clone(),
-        bind_addr,
-        client_bind_port,
-    )
-    .await;
+    start_client_server(state.clone(), bind_addr, client_bind_port).await;
 
     info!("{} - Node startup complete", node_id);
 }
 
-async fn start_node_server(
-    state: Arc<RaftNode>,
-    heartbeat_tx: Sender<()>,
-    bind_addr: IpAddr,
-    bind_port: u16,
-) {
+async fn start_node_server(state: Arc<RaftNode>, bind_addr: IpAddr, bind_port: u16) {
     let node_listener =
         tarpc::serde_transport::tcp::listen(&(bind_addr, bind_port), Bincode::default)
             .await
@@ -549,11 +519,7 @@ async fn start_node_server(
         // the generated World trait.
         .map(move |channel| {
             // Created for every new connection
-            let server = ConnectionHandler {
-                state: state.clone(),
-                election_timeout_handler: heartbeat_tx.clone(),
-            };
-            channel.execute(NodeRPC::serve(server))
+            channel.execute(NodeRPC::serve(state.clone()))
         })
         .buffer_unordered(10000)
         .for_each(|_| async {});
@@ -561,12 +527,7 @@ async fn start_node_server(
     tokio::spawn(server_for_node);
 }
 
-async fn start_client_server(
-    state: Arc<RaftNode>,
-    heartbeat_tx: Sender<()>,
-    bind_addr: IpAddr,
-    bind_port: u16,
-) {
+async fn start_client_server(state: Arc<RaftNode>, bind_addr: IpAddr, bind_port: u16) {
     let mut client_listener =
         tarpc::serde_transport::tcp::listen(&(bind_addr, bind_port), Bincode::default)
             .await
@@ -582,12 +543,7 @@ async fn start_client_server(
         // serve is generated by the service attribute. It takes as input any type implementing
         // the generated World trait.
         .map(move |channel| {
-            // Created for every new connection
-            let server = ConnectionHandler {
-                state: client_server_state.clone(),
-                election_timeout_handler: heartbeat_tx.clone(),
-            };
-            channel.execute(ClientRPC::serve(server))
+            channel.execute(ClientRPC::serve(client_server_state.clone()))
         })
         .buffer_unordered(10000)
         .for_each(|_| async {});
