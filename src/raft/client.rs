@@ -31,11 +31,11 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(seeds: Vec<SocketAddr>) -> Client {
+    pub fn new(seeds: &[SocketAddr]) -> Client {
         // TODO: Add Result and deal with invalid inputs
         Client {
             rpc_client: Option::None,
-            seeds,
+            seeds: seeds.to_vec(),
         }
     }
 

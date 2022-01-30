@@ -12,7 +12,7 @@ pub async fn main() {
         .filter_level(LevelFilter::Info)
         .filter_module("tarpc", LevelFilter::Error)
         .filter_module("ribut::raft::node", LevelFilter::Warn)
-        .filter_module("ribut::raft::client", LevelFilter::Debug)
+        .filter_module("ribut::raft::client", LevelFilter::Warn)
         .init();
 
     const LOCAL: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
@@ -36,7 +36,7 @@ pub async fn main() {
 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let mut client = Client::new(seeds.clone());
+    let mut client = Client::new(&seeds);
     let mut joins = Vec::new();
 
     {
@@ -51,7 +51,15 @@ pub async fn main() {
 
     future::join_all(joins).await;
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let resp = client.write_val(16).await;
+    println!("{:?}", resp);
+
+    let resp = client.read().await;
+    println!("{:?}", resp);
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     let resp = client.read().await;
     println!("{:?}", resp);

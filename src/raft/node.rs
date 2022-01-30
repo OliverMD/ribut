@@ -255,6 +255,56 @@ impl RaftNode {
             }
         };
     }
+
+    async fn read_log(&self) -> Response<Vec<u32>> {
+        if matches!(*self.node_state.read(), NodeState::Leader { .. }) {
+            let ret: Vec<u32> = self.state.read().log[0..=self.state.read().commit_index as usize]
+                .iter()
+                .filter_map(|(_, e)| match e {
+                    LogEntry::Config => None,
+                    LogEntry::Other(x) => Some(*x),
+                })
+                .collect();
+
+            Response::Ok(ret)
+        } else {
+            Response::NotLeader(self.leader_conn_info())
+        }
+    }
+
+    fn leader_conn_info(&self) -> Option<SocketAddr> {
+        // TODO: This is wrong, it returns the port used for node comms rather than client comms
+
+        self.state
+            .read()
+            .leader_id
+            .map(|node_id| SocketAddr::from(*self.conn_infos.get(&node_id).unwrap()))
+    }
+
+    async fn add_entry(&self, entry: u32) -> Response<()> {
+        if matches!(self.node_state.read().deref(), NodeState::Leader { .. }) {
+            let current_term = self.state.read().current_term;
+
+            self.state
+                .write()
+                .log
+                .push((current_term, LogEntry::Other(entry)));
+
+            Response::Ok(())
+        } else {
+            Response::NotLeader(self.leader_conn_info())
+        }
+    }
+
+    async fn leader(&self) -> Response<()> {
+        if matches!(*self.node_state.read(), NodeState::Leader { .. }) {
+            debug!("{} - leader - we are leader", self.node_id);
+            Response::Ok(())
+        } else {
+            debug!("{} - leader - not leader", self.node_id);
+            Response::NotLeader(self.leader_conn_info())
+        }
+    }
 }
 
 // Created for each inbound connection with another node
@@ -428,63 +478,15 @@ impl NodeRPC for ConnectionHandler {
 #[tarpc::server]
 impl ClientRPC for ConnectionHandler {
     async fn read_log(self, _: context::Context) -> Response<Vec<u32>> {
-        // TODO: Should we only return committed entries?
-
-        if matches!(*self.state.node_state.read(), NodeState::Leader { .. }) {
-            let ret: Vec<u32> = self.state.state.read().log
-                [0..=self.state.state.read().commit_index as usize]
-                .iter()
-                .filter_map(|(_, e)| match e {
-                    LogEntry::Config => None,
-                    LogEntry::Other(x) => Some(*x),
-                })
-                .collect();
-
-            Response::Ok(ret)
-        } else {
-            Response::NotLeader(self.leader_conn_info())
-        }
+        self.state.read_log().await
     }
 
     async fn add_entry(self, _: context::Context, entry: u32) -> Response<()> {
-        if matches!(
-            self.state.node_state.read().deref(),
-            NodeState::Leader { .. }
-        ) {
-            let current_term = self.state.state.read().current_term;
-
-            self.state
-                .state
-                .write()
-                .log
-                .push((current_term, LogEntry::Other(entry)));
-
-            Response::Ok(())
-        } else {
-            Response::NotLeader(self.leader_conn_info())
-        }
+        self.state.add_entry(entry).await
     }
 
     async fn leader(self, _context: Context) -> Response<()> {
-        if matches!(*self.state.node_state.read(), NodeState::Leader { .. }) {
-            debug!("{} - leader - we are leader", self.state.node_id);
-            Response::Ok(())
-        } else {
-            debug!("{} - leader - not leader", self.state.node_id);
-            Response::NotLeader(self.leader_conn_info())
-        }
-    }
-}
-
-impl ConnectionHandler {
-    fn leader_conn_info(&self) -> Option<SocketAddr> {
-        // TODO: This is wrong, it returns the port used for node comms rather than client comms
-
-        self.state
-            .state
-            .read()
-            .leader_id
-            .map(|node_id| SocketAddr::from(*self.state.conn_infos.get(&node_id).unwrap()))
+        self.state.leader().await
     }
 }
 
