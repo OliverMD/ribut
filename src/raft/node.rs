@@ -262,6 +262,168 @@ impl RaftNode {
         };
     }
 
+    fn start_election_timeout(
+        self: Arc<Self>,
+        election_timeout: Duration,
+        mut election_rx: Receiver<()>,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                match time::timeout(election_timeout, election_rx.recv()).await {
+                    Ok(Some(())) => {
+                        // Do nothing we got the heartbeat in time
+                    }
+                    Ok(None) => {
+                        break;
+                    }
+                    Err(_) => {
+                        if !matches!(*self.node_state.read(), NodeState::Leader { .. }) {
+                            info!("{} - Election timeout hit", self.node_id);
+                        }
+                        // Election timeout
+                        // TODO: Do we want to await here or continue the timeout tracking, should
+                        // we launch another task here?
+                        let state = self.clone();
+                        tokio::spawn(async move { state.handle_election_timout().await });
+                    }
+                }
+            }
+        });
+    }
+
+    // TODO: This doesn't need to be running all the time
+    fn start_heartbeats(self: Arc<Self>) {
+        let mut interval = time::interval(Duration::from_millis(200));
+        let node_id = self.node_id;
+        let clients: HashMap<NodeId, NodeRPCClient> = {
+            self.conns
+                .read()
+                .iter()
+                .map(|(a, b)| (*a, b.clone()))
+                .collect()
+        };
+        let state = self.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if matches!(*state.node_state.read(), NodeState::Leader { .. }) {
+                    for (other_id, client) in &clients {
+                        let (current_term, last_log_idx, last_log_term) = {
+                            let idx_for_node = {
+                                match state.node_state.read().deref() {
+                                    NodeState::Leader {
+                                        next_index,
+                                        match_index: _,
+                                    } => Some(*next_index.get(other_id).unwrap()),
+                                    _ => None,
+                                }
+                            }
+                                .unwrap() // TODO: Handle None case
+                                - 1;
+
+                            debug!(
+                                "{} - idx for node {}: {}",
+                                state.node_id, other_id, idx_for_node
+                            );
+
+                            let state = state.state.read();
+                            (
+                                state.current_term,
+                                idx_for_node, // TODO: This needs to be fixed with indexing...
+                                if idx_for_node > 0 {
+                                    state
+                                        .log
+                                        .get(idx_for_node as usize - 1) // TODO: This is an instance where the indexing could get messed up
+                                        .map(|t| t.0)
+                                        .unwrap_or(0)
+                                } else {
+                                    0
+                                },
+                            )
+                        };
+
+                        let result = client
+                            .append_entries(
+                                context::current(),
+                                node_id,
+                                current_term,
+                                node_id,
+                                last_log_idx,
+                                last_log_term,
+                                state.entries_to_send(*other_id),
+                                last_log_idx, // TODO: This is clearly wrong
+                            )
+                            .await
+                            .unwrap();
+
+                        // TODO: Fan this out, like with the election requests
+
+                        debug!("{} - Heartbeat response: {:?}", node_id, result);
+                        if result.term == state.state.read().current_term {
+                            if result.success {
+                                if let NodeState::Leader {
+                                    next_index,
+                                    match_index,
+                                } = state.node_state.write().deref_mut()
+                                {
+                                    *next_index.get_mut(other_id).unwrap() = result.match_index + 1;
+                                    *match_index.get_mut(other_id).unwrap() = result.match_index;
+                                }
+                            } else if let NodeState::Leader {
+                                next_index,
+                                match_index: _,
+                            } = state.node_state.write().deref_mut()
+                            {
+                                let ni = next_index.get_mut(other_id).unwrap();
+                                *ni = max(ni.saturating_sub(1), 1);
+                            }
+                        }
+                    }
+
+                    // AdvanceCommitIndex
+                    // We need to find the maximum matchIndex that is on at least 50% of nodes and that index
+                    // needs to have the same term as the current term
+
+                    let new_commit_idx = {
+                        let commit_idx = state.state.read().commit_index;
+
+                        let mut new_commit_idx = commit_idx;
+                        if let NodeState::Leader {
+                            next_index: _,
+                            match_index,
+                        } = state.node_state.read().deref()
+                        {
+                            for idx in commit_idx..state.state.read().log.len() as u32 {
+                                let a = match_index.values().filter(|&&i| i >= idx as u32).count();
+                                let b = (match_index.len() + 1) / 2;
+
+                                if a > b
+                                // TODO: This almost certainly wrong. Come up with better quorum solution
+                                {
+                                    new_commit_idx = idx;
+                                }
+                            }
+
+                            if new_commit_idx != commit_idx {
+                                info!(
+                                    "{} - commit_index changed from {} to {}",
+                                    state.node_id, commit_idx, new_commit_idx
+                                )
+                            }
+
+                            new_commit_idx
+                        } else {
+                            panic!("Not in leader state") // TODO: I think this can sometimes happen
+                        }
+                    };
+
+                    state.state.write().commit_index = new_commit_idx;
+                }
+                interval.tick().await;
+            }
+        });
+    }
+
     fn leader_conn_info(&self) -> Option<SocketAddr> {
         // TODO: This is wrong, it returns the port used for node comms rather than client comms
 
@@ -497,9 +659,11 @@ pub async fn start_raft_node(
     state.connect().await;
 
     info!("{} - Starting heartbeats", node_id);
-    start_heartbeats(state.clone());
+    state.clone().start_heartbeats();
     info!("{} - Starting election timeout", node_id);
-    start_election_timeout(state.clone(), election_timeout, election_rx);
+    state
+        .clone()
+        .start_election_timeout(election_timeout, election_rx);
     info!("{} - Starting client server", node_id);
     start_client_server(state.clone(), bind_addr, client_bind_port).await;
 
@@ -549,166 +713,4 @@ async fn start_client_server(state: Arc<RaftNode>, bind_addr: IpAddr, bind_port:
         .for_each(|_| async {});
 
     tokio::spawn(server_for_client_fut);
-}
-
-// TODO: This doesn't need to be running all the time, change this to only be running when the node is a leader
-fn start_heartbeats(state: Arc<RaftNode>) {
-    let mut interval = time::interval(Duration::from_millis(200));
-    let node_id = state.node_id;
-    let clients: HashMap<NodeId, NodeRPCClient> = {
-        state
-            .conns
-            .read()
-            .iter()
-            .map(|(a, b)| (*a, b.clone()))
-            .collect()
-    };
-
-    tokio::spawn(async move {
-        loop {
-            if matches!(*state.node_state.read(), NodeState::Leader { .. }) {
-                for (other_id, client) in &clients {
-                    let (current_term, last_log_idx, last_log_term) = {
-                        let idx_for_node = {
-                            match state.node_state.read().deref() {
-                                NodeState::Leader {
-                                    next_index,
-                                    match_index: _,
-                                } => Some(*next_index.get(other_id).unwrap()),
-                                _ => None,
-                            }
-                        }
-                        .unwrap() // TODO: Handle None case
-                            - 1;
-
-                        debug!(
-                            "{} - idx for node {}: {}",
-                            state.node_id, other_id, idx_for_node
-                        );
-
-                        let state = state.state.read();
-                        (
-                            state.current_term,
-                            idx_for_node, // TODO: This needs to be fixed with indexing...
-                            if idx_for_node > 0 {
-                                state
-                                    .log
-                                    .get(idx_for_node as usize - 1) // TODO: This is an instance where the indexing could get messed up
-                                    .map(|t| t.0)
-                                    .unwrap_or(0)
-                            } else {
-                                0
-                            },
-                        )
-                    };
-
-                    let result = client
-                        .append_entries(
-                            context::current(),
-                            node_id,
-                            current_term,
-                            node_id,
-                            last_log_idx,
-                            last_log_term,
-                            state.entries_to_send(*other_id),
-                            last_log_idx, // TODO: This is clearly wrong
-                        )
-                        .await
-                        .unwrap();
-
-                    // TODO: Fan this out, like with the election requests
-
-                    debug!("{} - Heartbeat response: {:?}", node_id, result);
-                    if result.term == state.state.read().current_term {
-                        if result.success {
-                            if let NodeState::Leader {
-                                next_index,
-                                match_index,
-                            } = state.node_state.write().deref_mut()
-                            {
-                                *next_index.get_mut(other_id).unwrap() = result.match_index + 1;
-                                *match_index.get_mut(other_id).unwrap() = result.match_index;
-                            }
-                        } else if let NodeState::Leader {
-                            next_index,
-                            match_index: _,
-                        } = state.node_state.write().deref_mut()
-                        {
-                            let ni = next_index.get_mut(other_id).unwrap();
-                            *ni = max(ni.saturating_sub(1), 1);
-                        }
-                    }
-                }
-
-                // AdvanceCommitIndex
-                // We need to find the maximum matchIndex that is on at least 50% of nodes and that index
-                // needs to have the same term as the current term
-
-                let new_commit_idx = {
-                    let commit_idx = state.state.read().commit_index;
-
-                    let mut new_commit_idx = commit_idx;
-                    if let NodeState::Leader {
-                        next_index: _,
-                        match_index,
-                    } = state.node_state.read().deref()
-                    {
-                        for idx in commit_idx..state.state.read().log.len() as u32 {
-                            let a = match_index.values().filter(|&&i| i >= idx as u32).count();
-                            let b = (match_index.len() + 1) / 2;
-
-                            if a > b
-                            // TODO: This almost certainly wrong. Come up with better quorum solution
-                            {
-                                new_commit_idx = idx;
-                            }
-                        }
-
-                        if new_commit_idx != commit_idx {
-                            info!(
-                                "{} - commit_index changed from {} to {}",
-                                state.node_id, commit_idx, new_commit_idx
-                            )
-                        }
-
-                        new_commit_idx
-                    } else {
-                        panic!("Not in leader state") // TODO: I think this can sometimes happen
-                    }
-                };
-
-                state.state.write().commit_index = new_commit_idx;
-            }
-            interval.tick().await;
-        }
-    });
-}
-
-fn start_election_timeout(
-    state: Arc<RaftNode>,
-    election_timeout: Duration,
-    mut election_rx: Receiver<()>,
-) {
-    tokio::spawn(async move {
-        loop {
-            match time::timeout(election_timeout, election_rx.recv()).await {
-                Ok(Some(())) => {
-                    // Do nothing we got the heartbeat in time
-                }
-                Ok(None) => {
-                    break;
-                }
-                Err(_) => {
-                    if !matches!(*state.node_state.read(), NodeState::Leader { .. }) {
-                        info!("{} - Election timeout hit", state.node_id);
-                    }
-                    // Election timeout
-                    // TODO: Do we want to await here or continue the timeout tracking, should
-                    // we launch another task here?
-                    let state = state.clone();
-                    tokio::spawn(async move { state.handle_election_timout().await });
-                }
-            }
-        }
-    });
 }
