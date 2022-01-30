@@ -17,13 +17,31 @@ pub async fn main() {
 
     const LOCAL: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
     let node_a = tokio::spawn(async {
-        start_raft_node(LOCAL, 6000, 7000, vec![(LOCAL, 7001), (LOCAL, 7002)]).await
+        start_raft_node(
+            LOCAL,
+            6000,
+            7000,
+            vec![(LOCAL, 7001).into(), (LOCAL, 7002).into()],
+        )
+        .await
     });
     let node_b = tokio::spawn(async {
-        start_raft_node(LOCAL, 6001, 7001, vec![(LOCAL, 7000), (LOCAL, 7002)]).await
+        start_raft_node(
+            LOCAL,
+            6001,
+            7001,
+            vec![(LOCAL, 7000).into(), (LOCAL, 7002).into()],
+        )
+        .await
     });
     let node_c = tokio::spawn(async {
-        start_raft_node(LOCAL, 6002, 7002, vec![(LOCAL, 7000), (LOCAL, 7001)]).await
+        start_raft_node(
+            LOCAL,
+            6002,
+            7002,
+            vec![(LOCAL, 7000).into(), (LOCAL, 7001).into()],
+        )
+        .await
     });
 
     future::join_all(vec![node_a, node_b, node_c]).await;

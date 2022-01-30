@@ -3,6 +3,7 @@ pub mod node;
 
 use crate::raft::client::Response;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::{
     collections::hash_map::DefaultHasher,
     fmt::{Display, Formatter},
@@ -24,6 +25,15 @@ impl From<(IpAddr, u16)> for NodeId {
         let mut hasher = DefaultHasher::new();
         addr.hash(&mut hasher);
         port.hash(&mut hasher);
+
+        NodeId(hasher.finish())
+    }
+}
+
+impl From<SocketAddr> for NodeId {
+    fn from(s: SocketAddr) -> Self {
+        let mut hasher = DefaultHasher::new();
+        s.hash(&mut hasher);
 
         NodeId(hasher.finish())
     }

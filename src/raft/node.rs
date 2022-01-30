@@ -66,7 +66,7 @@ struct GeneralState {
 pub struct RaftNode {
     state: RwLock<GeneralState>,
     node_state: RwLock<NodeState>,
-    conn_infos: HashMap<NodeId, (IpAddr, u16)>,
+    conn_infos: HashMap<NodeId, SocketAddr>,
     conns: RwLock<HashMap<NodeId, NodeRPCClient>>, // TODO: Can we do better?
     node_id: NodeId,
     election_timeout_handler: Sender<()>,
@@ -75,7 +75,7 @@ pub struct RaftNode {
 impl RaftNode {
     fn new(
         node_id: NodeId,
-        conn_infos: Vec<(IpAddr, u16)>,
+        conn_infos: Vec<SocketAddr>,
         election_timeout_handler: Sender<()>,
     ) -> Self {
         Self {
@@ -643,7 +643,7 @@ pub async fn start_raft_node(
     bind_addr: IpAddr,
     client_bind_port: u16,
     node_bind_port: u16,
-    others: Vec<(IpAddr, u16)>,
+    others: Vec<SocketAddr>,
 ) {
     let node_id = (bind_addr, node_bind_port).into();
     let election_timeout = Duration::from_millis(1000 + rand::thread_rng().gen_range(0..250));
