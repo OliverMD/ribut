@@ -1,6 +1,8 @@
 use clap::Parser;
+use env_logger::Builder;
+use log::LevelFilter;
 use ribut::raft::node::start_raft_node;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
@@ -19,6 +21,13 @@ struct Cli {
 
 fn main() {
     let args = Cli::parse();
+
+    Builder::new()
+        .filter_level(LevelFilter::Info)
+        .filter_module("tarpc", LevelFilter::Warn)
+        .filter_module("ribut::raft::node", LevelFilter::Info)
+        .init();
+
     console_subscriber::init();
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -29,7 +38,7 @@ fn main() {
     }
     builder.build().unwrap().block_on(async {
         start_raft_node(
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
             args.client_port,
             args.protocol_port,
             parse_others(&args.others),

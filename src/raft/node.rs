@@ -155,9 +155,12 @@ impl RaftNode {
                     let mut state = self.state.write();
                     state.current_term += 1;
                     state.voted_for = Some(self.node_id);
+                }
 
+                if self.conn_infos.is_empty() {
+                    self.transition_to_leader();
+                } else {
                     info!("{} - State change to Candidate", self.node_id);
-
                     *self.node_state.write() = Candidate;
                 }
 
@@ -206,28 +209,7 @@ impl RaftNode {
                                         NodeState::Candidate { .. }
                                     ) && vote_count >= self.conn_infos.len() / 2
                                     {
-                                        let set_idx: u32 = self.state.read().log.len() as u32 + 1;
-
-                                        debug!("{} - Set idx: {}", self.node_id, set_idx);
-
-                                        *self.node_state.write() = NodeState::Leader {
-                                            next_index: self
-                                                .conns
-                                                .read()
-                                                .keys()
-                                                .map(|n| (*n, set_idx))
-                                                .collect(),
-                                            match_index: self
-                                                .conns
-                                                .read()
-                                                .keys()
-                                                .map(|n| (*n, 0))
-                                                .collect(),
-                                        };
-
-                                        self.state.write().leader_id = Some(self.node_id);
-
-                                        info!("{} - State change to leader Leader", self.node_id);
+                                        self.transition_to_leader();
                                         break; // We are now leader
                                     }
                                 } else if term > self.state.read().current_term {
@@ -260,6 +242,21 @@ impl RaftNode {
                 // Ignore
             }
         };
+    }
+
+    fn transition_to_leader(&self) {
+        let set_idx: u32 = self.state.read().log.len() as u32 + 1;
+
+        debug!("{} - Set idx: {}", self.node_id, set_idx);
+
+        *self.node_state.write() = NodeState::Leader {
+            next_index: self.conns.read().keys().map(|n| (*n, set_idx)).collect(),
+            match_index: self.conns.read().keys().map(|n| (*n, 0)).collect(),
+        };
+
+        self.state.write().leader_id = Some(self.node_id);
+
+        info!("{} - State change to leader", self.node_id);
     }
 
     fn start_election_timeout(
@@ -599,6 +596,10 @@ impl NodeRPC for Arc<RaftNode> {
 impl ClientRPC for Arc<RaftNode> {
     async fn read_log(self, _: context::Context) -> Response<Vec<u32>> {
         if matches!(*self.node_state.read(), NodeState::Leader { .. }) {
+            if self.state.read().log.is_empty() {
+                return Response::Ok(vec![]);
+            }
+
             let ret: Vec<u32> = self.state.read().log[0..=self.state.read().commit_index as usize]
                 .iter()
                 .filter_map(|(_, e)| match e {
