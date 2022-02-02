@@ -159,6 +159,7 @@ impl RaftNode {
 
                 if self.conn_infos.is_empty() {
                     self.transition_to_leader();
+                    return;
                 } else {
                     info!("{} - State change to Candidate", self.node_id);
                     *self.node_state.write() = Candidate;

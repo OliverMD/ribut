@@ -16,6 +16,9 @@ struct Cli {
     #[clap(short, long, default_value_t = 6000)]
     client_port: u16,
 
+    #[clap(short, long)]
+    tracing_enabled: bool,
+
     others: Vec<String>,
 }
 
@@ -28,7 +31,9 @@ fn main() {
         .filter_module("ribut::raft::node", LevelFilter::Info)
         .init();
 
-    console_subscriber::init();
+    if args.tracing_enabled {
+        console_subscriber::init();
+    }
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
