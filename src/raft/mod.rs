@@ -22,11 +22,7 @@ impl Display for NodeId {
 
 impl From<(IpAddr, u16)> for NodeId {
     fn from((addr, port): (IpAddr, u16)) -> Self {
-        let mut hasher = DefaultHasher::new();
-        addr.hash(&mut hasher);
-        port.hash(&mut hasher);
-
-        NodeId(hasher.finish())
+        SocketAddr::new(addr, port).into()
     }
 }
 
