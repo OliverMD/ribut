@@ -42,7 +42,7 @@ fn main() {
         builder.worker_threads(num_workers as usize);
     }
     builder.build().unwrap().block_on(async {
-        start_raft_node(
+        start_raft_node::<u32>(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             args.client_port,
             args.protocol_port,

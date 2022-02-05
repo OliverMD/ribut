@@ -17,7 +17,7 @@ pub async fn main() {
 
     const LOCAL: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
     let node_a = tokio::spawn(async {
-        start_raft_node(
+        start_raft_node::<u32>(
             LOCAL,
             6000,
             7000,
@@ -26,7 +26,7 @@ pub async fn main() {
         .await
     });
     let node_b = tokio::spawn(async {
-        start_raft_node(
+        start_raft_node::<u32>(
             LOCAL,
             6001,
             7001,
@@ -35,7 +35,7 @@ pub async fn main() {
         .await
     });
     let node_c = tokio::spawn(async {
-        start_raft_node(
+        start_raft_node::<u32>(
             LOCAL,
             6002,
             7002,

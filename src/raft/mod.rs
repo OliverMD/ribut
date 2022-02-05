@@ -49,15 +49,15 @@ struct RequestVoteResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-enum LogEntry {
+enum LogEntry<T> {
     Config,
-    Other(u32),
+    Other(T),
 }
 
 #[tarpc::service]
 pub trait ClientRPC {
-    async fn read_log() -> Response<Vec<u32>>;
-    async fn add_entry(entry: u32) -> Response<()>;
+    async fn read_log() -> Response<Vec<u8>>;
+    async fn add_entry(entry: Vec<u8>) -> Response<()>;
 
     /// Returns Ok(()) iff it is the leader. NotLeader(leader) otherwise
     async fn leader() -> Response<()>;
@@ -71,7 +71,7 @@ trait NodeRPC {
         leader_id: NodeId,
         prev_log_index: u32,
         prev_log_term: u32,
-        entries: Vec<(u32, u32, LogEntry)>, // (index, term, entry)
+        entries: Vec<(u32, u32, Vec<u8>)>, // (index, term, entry)
         leader_commit: u32,
     ) -> AppendEntriesResult;
 

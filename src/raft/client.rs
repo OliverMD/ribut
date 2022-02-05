@@ -42,11 +42,16 @@ impl Client {
     pub async fn read(&mut self) -> Option<Vec<u32>> {
         self.perform(|client| async move { client.read_log(Context::current()).await })
             .await
+            .map(|r| bincode::deserialize(&r).unwrap())
     }
 
     pub async fn write_val(&mut self, val: u32) -> Option<()> {
-        self.perform(|client| async move { client.add_entry(Context::current(), val).await })
-            .await
+        self.perform(|client| async move {
+            client
+                .add_entry(Context::current(), bincode::serialize(&val).unwrap())
+                .await
+        })
+        .await
     }
 
     async fn perform<A, R, Fut>(&mut self, action: A) -> Option<R>

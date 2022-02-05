@@ -24,3 +24,4 @@ env_logger = "0.9"
 clap = {version = "3.0", features = ["derive"]}
 console-subscriber = "0.1"
 regex = "1.5"
+bincode = "1.3"

@@ -11,7 +11,9 @@ use itertools::Itertools;
 use log::{debug, error, info, warn};
 use parking_lot::RwLock;
 use rand::Rng;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::{
     cmp::{max, min},
@@ -50,14 +52,13 @@ impl Default for NodeState {
     }
 }
 
-#[derive(Default)]
-struct GeneralState {
+struct GeneralState<T> {
     // TODO: Optionally persist to disk
     current_term: u32,
     voted_for: Option<NodeId>,
 
     // u32 is the term
-    log: Vec<(u32, LogEntry)>, // TODO: This likely needs to be indexed from 1
+    log: Vec<(u32, LogEntry<T>)>, // TODO: This likely needs to be indexed from 1
 
     commit_index: u32,
     last_applied: u32,
@@ -65,8 +66,21 @@ struct GeneralState {
     leader_id: Option<NodeId>,
 }
 
-pub struct RaftNode {
-    state: RwLock<GeneralState>,
+impl<T> Default for GeneralState<T> {
+    fn default() -> Self {
+        GeneralState {
+            current_term: 0,
+            voted_for: None,
+            log: vec![],
+            commit_index: 0,
+            last_applied: 0,
+            leader_id: None,
+        }
+    }
+}
+
+pub struct RaftNode<T> {
+    state: RwLock<GeneralState<T>>,
     node_state: RwLock<NodeState>,
     conn_infos: HashMap<NodeId, SocketAddr>,
     conns: RwLock<HashMap<NodeId, NodeRPCClient>>, // TODO: Can we do better?
@@ -74,7 +88,10 @@ pub struct RaftNode {
     election_timeout_handler: Sender<()>,
 }
 
-impl RaftNode {
+impl<T> RaftNode<T>
+where
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + Debug + 'static,
+{
     fn new(
         node_id: NodeId,
         conn_infos: Vec<SocketAddr>,
@@ -93,7 +110,7 @@ impl RaftNode {
         }
     }
 
-    fn entries_to_send(&self, node_id: NodeId) -> Vec<(u32, u32, LogEntry)> {
+    fn entries_to_send(&self, node_id: NodeId) -> Vec<(u32, u32, Vec<u8>)> {
         if let NodeState::Leader {
             next_index,
             match_index: _,
@@ -106,14 +123,14 @@ impl RaftNode {
                 self.node_id, node_id, next_idx
             );
 
-            let send: Vec<(u32, u32, LogEntry)> = self
+            let send: Vec<(u32, u32, Vec<u8>)> = self
                 .state
                 .read()
                 .log
                 .iter()
                 .enumerate()
                 .skip(next_idx.saturating_sub(1) as usize)
-                .map(|(i, (t, e))| (i as u32, *t, e.clone()))
+                .map(|(i, (t, e))| (i as u32, *t, bincode::serialize(e).unwrap()))
                 .collect();
 
             if !send.is_empty() {
@@ -435,7 +452,10 @@ impl RaftNode {
 }
 
 #[tarpc::server]
-impl NodeRPC for Arc<RaftNode> {
+impl<T: Debug> NodeRPC for Arc<RaftNode<T>>
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+{
     async fn append_entries(
         self,
         _: context::Context,
@@ -444,10 +464,9 @@ impl NodeRPC for Arc<RaftNode> {
         leader_id: NodeId,
         prev_log_index: u32,
         prev_log_term: u32,
-        entries: Vec<(u32, u32, LogEntry)>,
+        entries: Vec<(u32, u32, Vec<u8>)>,
         leader_commit: u32,
     ) -> AppendEntriesResult {
-        // if entries.len() > 0 {
         debug!(
             "{} - Received append entries request: mterm: {}, ourterm: {}, pre_log_index: {}, pre_log_term: {}, entries: {:?}, leader_commit: {:?}",
             self.node_id,
@@ -458,7 +477,6 @@ impl NodeRPC for Arc<RaftNode> {
             entries,
             leader_commit
         );
-        // }
 
         let is_from_leader = {
             let state = self.state.read();
@@ -534,8 +552,9 @@ impl NodeRPC for Arc<RaftNode> {
 
             for (idx, t, e) in &entries {
                 if state.log.get(*idx as usize).is_none() {
+                    let entry = bincode::deserialize(e).unwrap();
                     debug!("{} - Adding entry {:?}", self.node_id, e.clone());
-                    state.log.push((*t, e.clone()));
+                    state.log.push((*t, entry));
                 }
             }
 
@@ -596,35 +615,38 @@ impl NodeRPC for Arc<RaftNode> {
 }
 
 #[tarpc::server]
-impl ClientRPC for Arc<RaftNode> {
-    async fn read_log(self, _: context::Context) -> Response<Vec<u32>> {
+impl<T> ClientRPC for Arc<RaftNode<T>>
+where
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + Debug + 'static,
+{
+    async fn read_log(self, _: context::Context) -> Response<Vec<u8>> {
         if matches!(*self.node_state.read(), NodeState::Leader { .. }) {
             if self.state.read().log.is_empty() {
                 return Response::Ok(vec![]);
             }
 
-            let ret: Vec<u32> = self.state.read().log[0..=self.state.read().commit_index as usize]
+            let ret: Vec<T> = self.state.read().log[0..=self.state.read().commit_index as usize]
                 .iter()
                 .filter_map(|(_, e)| match e {
                     LogEntry::Config => None,
-                    LogEntry::Other(x) => Some(*x),
+                    LogEntry::Other(x) => Some(x.clone()),
                 })
                 .collect();
 
-            Response::Ok(ret)
+            Response::Ok(bincode::serialize(&ret).unwrap())
         } else {
             Response::NotLeader(self.leader_conn_info())
         }
     }
 
-    async fn add_entry(self, _: context::Context, entry: u32) -> Response<()> {
+    async fn add_entry(self, _: context::Context, entry: Vec<u8>) -> Response<()> {
         if matches!(self.node_state.read().deref(), NodeState::Leader { .. }) {
             let current_term = self.state.read().current_term;
 
-            self.state
-                .write()
-                .log
-                .push((current_term, LogEntry::Other(entry)));
+            self.state.write().log.push((
+                current_term,
+                LogEntry::Other(bincode::deserialize(&entry).unwrap()),
+            ));
 
             Response::Ok(())
         } else {
@@ -643,16 +665,18 @@ impl ClientRPC for Arc<RaftNode> {
     }
 }
 
-pub async fn start_raft_node(
+pub async fn start_raft_node<T>(
     bind_addr: IpAddr,
     client_bind_port: u16,
     node_bind_port: u16,
     others: Vec<SocketAddr>,
-) {
+) where
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + Debug + 'static,
+{
     let node_id = (bind_addr, node_bind_port).into();
     let election_timeout = Duration::from_millis(1000 + rand::thread_rng().gen_range(0..250));
     let (heartbeat_tx, election_rx) = mpsc::channel(10);
-    let state = Arc::new(RaftNode::new(node_id, others, heartbeat_tx));
+    let state = Arc::new(RaftNode::<T>::new(node_id, others, heartbeat_tx));
 
     info!("{} - Starting node server", node_id);
 
@@ -674,9 +698,14 @@ pub async fn start_raft_node(
     info!("{} - Node startup complete", node_id);
 }
 
-async fn serve_rpc<F, S, Req>(state: Arc<RaftNode>, bind_addr: IpAddr, bind_port: u16, serve_gen: F)
-where
-    F: Fn(Arc<RaftNode>) -> S + Send + 'static,
+async fn serve_rpc<F, S, Req, T>(
+    state: Arc<RaftNode<T>>,
+    bind_addr: IpAddr,
+    bind_port: u16,
+    serve_gen: F,
+) where
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + Debug + 'static,
+    F: Fn(Arc<RaftNode<T>>) -> S + Send + 'static,
     S: tarpc::server::Serve<Req> + Send + Clone + 'static,
     Req: for<'a> Deserialize<'a> + Send + 'static,
     <S as Serve<Req>>::Fut: Send,
