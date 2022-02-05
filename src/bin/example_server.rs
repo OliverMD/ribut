@@ -50,7 +50,10 @@ fn main() {
         )
         .await;
 
-        loop {}
+        // wait forever
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to wait for ctrl-c");
     });
 }
 
