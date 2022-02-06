@@ -6,13 +6,15 @@ use ribut::raft::node::start_raft_node;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use tokio::time::Duration;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-pub async fn main() {
+// #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simple_test() {
     Builder::new()
+        .is_test(true)
         .filter_level(LevelFilter::Info)
         .filter_module("tarpc", LevelFilter::Error)
-        .filter_module("ribut::raft::node", LevelFilter::Warn)
-        .filter_module("ribut::raft::client", LevelFilter::Warn)
+        .filter_module("ribut::raft::node", LevelFilter::Info)
+        .filter_module("ribut::raft::client", LevelFilter::Info)
         .init();
 
     const LOCAL: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
@@ -81,4 +83,5 @@ pub async fn main() {
 
     let resp = client.read().await;
     println!("{:?}", resp);
+    assert_eq!(resp, Some(vec![0, 1, 4, 9, 16]));
 }

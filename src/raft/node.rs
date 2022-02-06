@@ -227,7 +227,7 @@ where
                                     if matches!(
                                         *self.node_state.read(),
                                         NodeState::Candidate { .. }
-                                    ) && vote_count >= self.conn_infos.len() / 2
+                                    ) && vote_count > (self.conn_infos.len() + 1) / 2
                                     {
                                         self.transition_to_leader();
                                         break; // We are now leader
