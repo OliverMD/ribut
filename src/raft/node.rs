@@ -18,11 +18,14 @@ use std::net::SocketAddr;
 use std::{
     cmp::{max, min},
     collections::HashMap,
+    iter,
     net::IpAddr,
     ops::{Deref, DerefMut},
     sync::Arc,
 };
+use stubborn_io::{ReconnectOptions, StubbornTcpStream};
 use tarpc::context::Context;
+use tarpc::serde_transport::Transport;
 use tarpc::server::Serve;
 use tarpc::{client, context, server, server::Channel};
 use tokio::{
@@ -145,20 +148,13 @@ where
 
     async fn connect(&self) {
         for (node_id, ip_port) in &self.conn_infos {
-            let transport = {
-                loop {
-                    let transport = tarpc::serde_transport::tcp::connect(ip_port, Bincode::default);
-                    match transport.await {
-                        Ok(res) => break res,
-                        Err(e) => error!(
-                            "{} - Error connection to {:?}: {}",
-                            self.node_id, ip_port, e
-                        ),
-                    }
-
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-            };
+            let reconnect_opts = ReconnectOptions::new()
+                .with_exit_if_first_connect_fails(false)
+                .with_retries_generator(|| iter::repeat(Duration::from_secs(1)));
+            let tcp_stream = StubbornTcpStream::connect_with_options(*ip_port, reconnect_opts)
+                .await
+                .unwrap();
+            let transport = Transport::from((tcp_stream, Bincode::default()));
 
             let client = NodeRPCClient::new(client::Config::default(), transport).spawn();
             self.conns.write().insert(*node_id, client);
@@ -180,11 +176,15 @@ where
                     self.transition_to_leader();
                     return;
                 } else {
-                    info!("{} - State change to Candidate", self.node_id);
+                    info!(
+                        "{} - State change to Candidate [term: {}]",
+                        self.node_id,
+                        self.state.read().current_term
+                    );
                     *self.node_state.write() = Candidate;
                 }
 
-                let mut vote_count = 0;
+                let mut vote_count = 1; // Vote for self
 
                 // Send out the requests for votes
                 let mut resp_stream = {
@@ -219,7 +219,8 @@ where
                     // TODO: Check the state we're on each loop
                     match res {
                         Ok(RequestVoteResult { term, vote_granted }) => {
-                            if term >= self.state.read().current_term {
+                            let our_term = self.state.read().current_term;
+                            if term >= our_term {
                                 if vote_granted {
                                     vote_count += 1;
 
@@ -232,11 +233,14 @@ where
                                         self.transition_to_leader();
                                         break; // We are now leader
                                     }
-                                } else if term > self.state.read().current_term {
+                                } else if term > our_term {
                                     self.state.write().current_term = term;
                                     // Become follower line 404 of spec
                                     *self.node_state.write() = Follower;
-                                    info!("{} - State change to Follower", self.node_id);
+                                    info!(
+                                        "{} - State change to Follower [term: {} > our term {}]",
+                                        self.node_id, term, our_term
+                                    );
                                     break;
                                 }
                             } else {
@@ -256,7 +260,7 @@ where
                 }
             }
             NodeState::Candidate { .. } => {
-                // Ignore
+                info!("Election restarted while a candidate");
             }
             NodeState::Leader { .. } => {
                 // Ignore
@@ -276,7 +280,11 @@ where
 
         self.state.write().leader_id = Some(self.node_id);
 
-        info!("{} - State change to leader", self.node_id);
+        info!(
+            "{} - State change to leader [term: {}]",
+            self.node_id,
+            self.state.read().current_term
+        );
     }
 
     fn start_election_timeout(
@@ -298,8 +306,6 @@ where
                             info!("{} - Election timeout hit", self.node_id);
                         }
                         // Election timeout
-                        // TODO: Do we want to await here or continue the timeout tracking, should
-                        // we launch another task here?
                         let state = self.clone();
                         tokio::spawn(async move { state.handle_election_timout().await });
                     }
@@ -494,7 +500,10 @@ where
             state.current_term = term;
             {
                 let mut node_state = self.node_state.write();
-                info!("{} - State change to Follower", self.node_id);
+                info!(
+                    "{} - State change to Follower due to append_entries [term: {}]",
+                    self.node_id, term
+                );
                 *node_state = Follower;
             }
 
@@ -587,7 +596,10 @@ where
 
             let mut node_state = self.node_state.write();
 
-            info!("{} - State change to Follower", self.node_id);
+            info!(
+                "{} - State change to Follower due to request_vote [term: {}]",
+                self.node_id, term
+            );
             *node_state = Follower;
         }
 
@@ -674,7 +686,7 @@ pub async fn start_raft_node<T>(
     T: Serialize + DeserializeOwned + Clone + Send + Sync + Debug + 'static,
 {
     let node_id = (bind_addr, node_bind_port).into();
-    let election_timeout = Duration::from_millis(1000 + rand::thread_rng().gen_range(0..250));
+    let election_timeout = Duration::from_millis(1000 + rand::thread_rng().gen_range(0..500));
     let (heartbeat_tx, election_rx) = mpsc::channel(10);
     let state = Arc::new(RaftNode::<T>::new(node_id, others, heartbeat_tx));
 
@@ -688,7 +700,10 @@ pub async fn start_raft_node<T>(
 
     info!("{} - Starting heartbeats", node_id);
     state.clone().start_heartbeats();
-    info!("{} - Starting election timeout", node_id);
+    info!(
+        "{} - Starting election timeout: {:?}",
+        node_id, election_timeout
+    );
     state
         .clone()
         .start_election_timeout(election_timeout, election_rx);

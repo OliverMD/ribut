@@ -27,8 +27,9 @@ fn main() {
 
     Builder::new()
         .filter_level(LevelFilter::Info)
-        .filter_module("tarpc", LevelFilter::Warn)
+        .filter_module("tarpc", LevelFilter::Error)
         .filter_module("ribut::raft::node", LevelFilter::Info)
+        .filter_module("stubborn_io::tokio::io", LevelFilter::Off)
         .init();
 
     if args.tracing_enabled {
